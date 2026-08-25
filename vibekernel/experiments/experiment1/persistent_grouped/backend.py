@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import torch
+from torch.utils.cpp_extension import load
+
+
+class PersistentGroupedBackend:
+    """CUTLASS 3.x SM90 persistent grouped GEMM backend."""
+
+    name = "persistent_grouped"
+
+    def __init__(self, cutlass_path: str | None = None, verbose_build: bool = False) -> None:
+        self.cutlass_path = cutlass_path
+        self.verbose_build = verbose_build
+        self._outputs: list[torch.Tensor] = []
+        self._extension = None
+        self._problems = []
+        self._runner = None
+
+    def _resolve_cutlass(self) -> Path:
+        raw = self.cutlass_path or os.environ.get("CUTLASS_PATH")
+        if not raw:
+            raise RuntimeError(
+                "CUTLASS_PATH must point to an NVIDIA CUTLASS checkout "
+                "containing include/cutlass/cutlass.h"
+            )
+        root = Path(raw).expanduser().resolve()
+        header = root / "include" / "cutlass" / "cutlass.h"
+        if not header.is_file():
+            raise RuntimeError(f"invalid CUTLASS_PATH: missing {header}")
+        return root
+
+    def _load_extension(self) -> None:
+        if self._extension is not None:
+            return
+        cutlass = self._resolve_cutlass()
+        source = Path(__file__).resolve().parent / "cutlass_grouped.cu"
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
+        self._extension = load(
+            name="vibekernel_cutlass_grouped_sm90",
+            sources=[str(source)],
+            extra_include_paths=[
+                str(cutlass / "include"),
+                str(cutlass / "tools" / "util" / "include"),
+            ],
+            extra_cuda_cflags=[
+                "-O3", "-lineinfo", "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+            ],
+            extra_cflags=["-O3"],
+            verbose=self.verbose_build,
+        )
+
+    def prepare(self, problems) -> None:
+        if not problems:
+            raise ValueError("workload is empty")
+        properties = torch.cuda.get_device_properties(problems[0].a.device)
+        if (properties.major, properties.minor) != (9, 0):
+            raise RuntimeError(
+                f"CUTLASS Hopper grouped GEMM requires SM90; got "
+                f"SM{properties.major}{properties.minor}"
+            )
+        self._load_extension()
+        self._problems = list(problems)
+        device = problems[0].a.device
+        # The grouped epilogue receives C and D pointer arrays. C aliases D and
+        # beta is zero; initialize storage so even a non-elided source load is safe.
+        self._outputs = [torch.zeros((p.m, p.n), device=device, dtype=torch.bfloat16) for p in problems]
+        self._runner = self._extension.CutlassGroupedRunner(
+            [p.a for p in problems], [p.b for p in problems], self._outputs,
+        )
+        self.run()
+        torch.cuda.synchronize()
+
+    def run(self) -> list[torch.Tensor]:
+        if self._runner is None:
+            raise RuntimeError("backend has not been prepared")
+        self._runner.run()
+        return self._outputs
+
+    def metadata(self) -> dict[str, object]:
+        native = self._runner.metadata() if self._runner is not None else {}
+        return {
+            "implementation": "CUTLASS 3.x Hopper persistent grouped GEMM",
+            "architecture": "SM90a",
+            "input_dtype": "bfloat16",
+            "accumulator_dtype": "float32",
+            "output_dtype": "bfloat16",
+            "mainloop": "TMA + GMMA warp-specialized",
+            "scheduler": "CUTLASS device-side grouped scheduler",
+            **native,
+        }
+
+    def close(self) -> None:
+        self._runner = None
+        self._outputs.clear()
+        self._problems.clear()
