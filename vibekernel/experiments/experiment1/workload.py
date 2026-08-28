@@ -4,10 +4,20 @@ from dataclasses import dataclass
 
 import torch
 
-# One MoE FFN "up" projection.  A batch of 512 tokens with top-2 routing
-# creates 1,024 expert-token assignments.  The deliberately skewed routing
-# distribution exercises the load imbalance that motivates grouped GEMM.
-EXPERT_TOKEN_COUNTS = (8, 24, 48, 80, 112, 160, 240, 352)
+# One MoE FFN "up" projection. A batch of 512 tokens with top-2 routing
+# creates 1,024 expert-token assignments. This 32-expert distribution is both
+# realistic for sparse routing and deliberately skewed: its 4..112 token
+# range supplies many short GEMMs for a persistent grouped scheduler.
+EXPERT_TOKEN_COUNTS = (
+    4, 4, 4, 4,
+    8, 8, 8, 8,
+    12, 12, 12, 12,
+    16, 16, 16, 16,
+    24, 24, 24, 24,
+    32, 32, 32, 32,
+    48, 48, 48, 48,
+    112, 112, 112, 112,
+)
 NUM_INPUT_TOKENS = 512
 TOP_K = 2
 NUM_EXPERTS = len(EXPERT_TOKEN_COUNTS)

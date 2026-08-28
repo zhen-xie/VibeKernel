@@ -7,9 +7,10 @@ up-projection grouped GEMM on an NVIDIA H100:
 2. A single Triton grouped-GEMM kernel.
 3. CUTLASS 3.x Hopper Persistent Grouped GEMM with device-side scheduling.
 
-The workload models 512 input tokens routed top-2 to eight experts (1,024
+The workload models 512 input tokens routed top-2 to 32 experts (1,024
 expert-token assignments). The intentionally skewed expert loads are
-`M=[8,24,48,80,112,160,240,352]`; each expert computes
+`M=[4,4,4,4,8,8,8,8,12,12,12,12,16,16,16,16,24,24,24,24,32,32,32,32,48,48,48,48,112,112,112,112]`;
+each expert computes
 `X_e[M,4096] @ W_e[4096,14336]`. This represents the first, expanding FFN
 projection of an MoE block. Inputs and outputs are BF16 and accumulation is
 FP32.
