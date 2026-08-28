@@ -37,11 +37,13 @@ class PersistentGroupedBackend:
         if self._extension is not None:
             return
         cutlass = self._resolve_cutlass()
-        source = Path(__file__).resolve().parent / "cutlass_grouped.cu"
+        source_dir = Path(__file__).resolve().parent
+        binding = source_dir / "binding.cpp"
+        source = source_dir / "cutlass_grouped.cu"
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
         self._extension = load(
             name="vibekernel_cutlass_grouped_sm90",
-            sources=[str(source)],
+            sources=[str(binding), str(source)],
             extra_include_paths=[
                 str(cutlass / "include"),
                 str(cutlass / "tools" / "util" / "include"),

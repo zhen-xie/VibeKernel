@@ -1,7 +1,4 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include "cutlass_grouped.hpp"
 
 #include "cute/tensor.hpp"
 #include "cutlass/bfloat16.h"
@@ -16,7 +13,8 @@
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 
-#include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -35,8 +33,6 @@ constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
-// M is intentionally the smallest Hopper grouped-GEMM CTA extent supported by
-// this configuration. Tiny M problems are predicated within the 64-row tile.
 using TileShape = Shape<_64, _128, _64>;
 using ClusterShape = Shape<_1, _1, _1>;
 using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
@@ -74,123 +70,81 @@ using StrideD = typename GemmKernel::InternalStrideD;
 using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 
 void check_cutlass(cutlass::Status status, const char* operation) {
-  TORCH_CHECK(status == cutlass::Status::kSuccess,
-              operation, " failed: ", cutlassGetStatusString(status));
+  if (status != cutlass::Status::kSuccess) {
+    throw std::runtime_error(std::string(operation) + " failed: " +
+                             cutlassGetStatusString(status));
+  }
 }
 
-void check_matrix(const torch::Tensor& tensor, const char* name) {
-  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous row-major");
-  TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name, " must be BF16");
-  TORCH_CHECK(tensor.dim() == 2, name, " must be a matrix");
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
-              name, " pointer must be 16-byte aligned for TMA");
-}
+}  // namespace
 
-class CutlassGroupedRunner {
- public:
-  CutlassGroupedRunner(
-      const std::vector<torch::Tensor>& inputs_a,
-      const std::vector<torch::Tensor>& inputs_b,
-      const std::vector<torch::Tensor>& outputs)
-      : inputs_a_(inputs_a), inputs_b_(inputs_b), outputs_(outputs) {
-    TORCH_CHECK(!inputs_a.empty(), "grouped GEMM requires at least one problem");
-    TORCH_CHECK(inputs_a.size() == inputs_b.size() && inputs_a.size() == outputs.size(),
-                "A, B, and output lists must have equal lengths");
-    group_count_ = static_cast<int>(inputs_a.size());
-    device_index_ = inputs_a.front().get_device();
-    c10::cuda::CUDAGuard guard(inputs_a.front().device());
+struct CutlassGroupedRunnerHandle {
+  CutlassGroupedRunnerHandle(
+      const void* const* a_ptrs,
+      const void* const* b_ptrs,
+      void* const* c_ptrs,
+      const int64_t* mnk_shapes,
+      int count,
+      int device,
+      cudaStream_t stream)
+      : group_count(count), device_index(device) {
+    if (group_count <= 0) {
+      throw std::invalid_argument("grouped GEMM requires at least one problem");
+    }
 
-    cudaDeviceProp properties{};
-    C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, device_index_));
-    TORCH_CHECK(properties.major == 9 && properties.minor == 0,
-                "CUTLASS grouped runner requires an SM90 GPU");
-
-    std::vector<const ElementA*> ptr_a_host;
-    std::vector<const ElementB*> ptr_b_host;
-    std::vector<const ElementC*> ptr_c_host;
-    std::vector<ElementC*> ptr_d_host;
+    std::vector<const ElementA*> a_host;
+    std::vector<const ElementB*> b_host;
+    std::vector<const ElementC*> c_host;
+    std::vector<ElementC*> d_host;
     std::vector<StrideA> stride_a_host;
     std::vector<StrideB> stride_b_host;
     std::vector<StrideC> stride_c_host;
     std::vector<StrideD> stride_d_host;
-    problem_shapes_host_.reserve(group_count_);
-    ptr_a_host.reserve(group_count_);
-    ptr_b_host.reserve(group_count_);
-    ptr_c_host.reserve(group_count_);
-    ptr_d_host.reserve(group_count_);
+    problem_shapes_host.reserve(group_count);
+    a_host.reserve(group_count);
+    b_host.reserve(group_count);
+    c_host.reserve(group_count);
+    d_host.reserve(group_count);
 
-    for (int i = 0; i < group_count_; ++i) {
-      const auto& a = inputs_a.at(i);
-      const auto& b = inputs_b.at(i);
-      const auto& d = outputs.at(i);
-      check_matrix(a, "A");
-      check_matrix(b, "B");
-      check_matrix(d, "D");
-      TORCH_CHECK(a.get_device() == device_index_ && b.get_device() == device_index_ &&
-                  d.get_device() == device_index_, "all grouped tensors must use one GPU");
-      TORCH_CHECK(a.size(1) == b.size(0), "A.K must equal B.K");
-      TORCH_CHECK(d.size(0) == a.size(0) && d.size(1) == b.size(1),
-                  "output has an incorrect shape");
-
-      const int m = static_cast<int>(a.size(0));
-      const int n = static_cast<int>(b.size(1));
-      const int k = static_cast<int>(a.size(1));
-      problem_shapes_host_.push_back({m, n, k});
-      ptr_a_host.push_back(reinterpret_cast<const ElementA*>(a.data_ptr<at::BFloat16>()));
-      ptr_b_host.push_back(reinterpret_cast<const ElementB*>(b.data_ptr<at::BFloat16>()));
-      // beta=0, but a valid C pointer keeps the epilogue descriptor uniform.
-      ptr_c_host.push_back(reinterpret_cast<const ElementC*>(d.data_ptr<at::BFloat16>()));
-      ptr_d_host.push_back(reinterpret_cast<ElementC*>(d.data_ptr<at::BFloat16>()));
+    for (int i = 0; i < group_count; ++i) {
+      const int m = static_cast<int>(mnk_shapes[3 * i]);
+      const int n = static_cast<int>(mnk_shapes[3 * i + 1]);
+      const int k = static_cast<int>(mnk_shapes[3 * i + 2]);
+      if (m <= 0 || n <= 0 || k <= 0) {
+        throw std::invalid_argument("all grouped GEMM dimensions must be positive");
+      }
+      problem_shapes_host.push_back({m, n, k});
+      a_host.push_back(reinterpret_cast<const ElementA*>(a_ptrs[i]));
+      b_host.push_back(reinterpret_cast<const ElementB*>(b_ptrs[i]));
+      c_host.push_back(reinterpret_cast<const ElementC*>(c_ptrs[i]));
+      d_host.push_back(reinterpret_cast<ElementC*>(c_ptrs[i]));
       stride_a_host.push_back(cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1}));
-      // CUTLASS expresses logical B strides in (N,K,L) coordinate order.
+      // CUTLASS represents B's logical coordinates as (N, K, L).
       stride_b_host.push_back(cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1}));
       stride_c_host.push_back(cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1}));
       stride_d_host.push_back(cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1}));
     }
 
-    problem_shapes_.reset(group_count_);
-    ptr_a_.reset(group_count_);
-    ptr_b_.reset(group_count_);
-    ptr_c_.reset(group_count_);
-    ptr_d_.reset(group_count_);
-    stride_a_.reset(group_count_);
-    stride_b_.reset(group_count_);
-    stride_c_.reset(group_count_);
-    stride_d_.reset(group_count_);
-    problem_shapes_.copy_from_host(problem_shapes_host_.data());
-    ptr_a_.copy_from_host(ptr_a_host.data());
-    ptr_b_.copy_from_host(ptr_b_host.data());
-    ptr_c_.copy_from_host(ptr_c_host.data());
-    ptr_d_.copy_from_host(ptr_d_host.data());
-    stride_a_.copy_from_host(stride_a_host.data());
-    stride_b_.copy_from_host(stride_b_host.data());
-    stride_c_.copy_from_host(stride_c_host.data());
-    stride_d_.copy_from_host(stride_d_host.data());
-    initialize();
-  }
+    problem_shapes.reset(group_count);
+    ptr_a.reset(group_count);
+    ptr_b.reset(group_count);
+    ptr_c.reset(group_count);
+    ptr_d.reset(group_count);
+    stride_a.reset(group_count);
+    stride_b.reset(group_count);
+    stride_c.reset(group_count);
+    stride_d.reset(group_count);
+    problem_shapes.copy_from_host(problem_shapes_host.data());
+    ptr_a.copy_from_host(a_host.data());
+    ptr_b.copy_from_host(b_host.data());
+    ptr_c.copy_from_host(c_host.data());
+    ptr_d.copy_from_host(d_host.data());
+    stride_a.copy_from_host(stride_a_host.data());
+    stride_b.copy_from_host(stride_b_host.data());
+    stride_c.copy_from_host(stride_c_host.data());
+    stride_d.copy_from_host(stride_d_host.data());
 
-  void run() {
-    c10::cuda::CUDAGuard guard(c10::Device(c10::DeviceType::CUDA, device_index_));
-    const auto stream = at::cuda::getCurrentCUDAStream(device_index_);
-    check_cutlass(gemm_.run(stream.stream()), "CUTLASS grouped GEMM run");
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
-
-  pybind11::dict metadata() const {
-    pybind11::dict result;
-    result["group_count"] = group_count_;
-    result["tile_shape_mnk"] = "64x128x64";
-    result["cluster_shape_mnk"] = "1x1x1";
-    result["kernel_schedule"] = "PtrArrayTmaWarpSpecializedPingpong";
-    result["workspace_bytes"] = workspace_size_;
-    return result;
-  }
-
- private:
-  void initialize() {
-    const auto stream = at::cuda::getCurrentCUDAStream(device_index_);
-    auto hardware = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>(device_index_);
+    auto hardware = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>(device_index);
     typename Gemm::Arguments arguments;
     decltype(arguments.epilogue.thread) fusion;
     fusion.alpha = 1.0f;
@@ -204,45 +158,57 @@ class CutlassGroupedRunner {
 
     arguments = typename Gemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {group_count_, problem_shapes_.get(), problem_shapes_host_.data()},
-        {ptr_a_.get(), stride_a_.get(), ptr_b_.get(), stride_b_.get()},
-        {fusion, ptr_c_.get(), stride_c_.get(), ptr_d_.get(), stride_d_.get()},
+        {group_count, problem_shapes.get(), problem_shapes_host.data()},
+        {ptr_a.get(), stride_a.get(), ptr_b.get(), stride_b.get()},
+        {fusion, ptr_c.get(), stride_c.get(), ptr_d.get(), stride_d.get()},
         hardware};
 
-    workspace_size_ = Gemm::get_workspace_size(arguments);
-    workspace_.reset(workspace_size_);
-    check_cutlass(gemm_.can_implement(arguments), "CUTLASS can_implement");
-    check_cutlass(gemm_.initialize(arguments, workspace_.get(), stream.stream()),
-                  "CUTLASS initialize");
+    workspace_size = Gemm::get_workspace_size(arguments);
+    workspace.reset(workspace_size);
+    check_cutlass(gemm.can_implement(arguments), "CUTLASS can_implement");
+    check_cutlass(gemm.initialize(arguments, workspace.get(), stream), "CUTLASS initialize");
   }
 
-  int group_count_ = 0;
-  int device_index_ = 0;
-  size_t workspace_size_ = 0;
-  std::vector<torch::Tensor> inputs_a_;
-  std::vector<torch::Tensor> inputs_b_;
-  std::vector<torch::Tensor> outputs_;
-  std::vector<UnderlyingProblemShape> problem_shapes_host_;
-  cutlass::DeviceAllocation<UnderlyingProblemShape> problem_shapes_;
-  cutlass::DeviceAllocation<const ElementA*> ptr_a_;
-  cutlass::DeviceAllocation<const ElementB*> ptr_b_;
-  cutlass::DeviceAllocation<const ElementC*> ptr_c_;
-  cutlass::DeviceAllocation<ElementC*> ptr_d_;
-  cutlass::DeviceAllocation<StrideA> stride_a_;
-  cutlass::DeviceAllocation<StrideB> stride_b_;
-  cutlass::DeviceAllocation<StrideC> stride_c_;
-  cutlass::DeviceAllocation<StrideD> stride_d_;
-  cutlass::DeviceAllocation<uint8_t> workspace_;
-  Gemm gemm_;
+  int group_count = 0;
+  int device_index = 0;
+  size_t workspace_size = 0;
+  std::vector<UnderlyingProblemShape> problem_shapes_host;
+  cutlass::DeviceAllocation<UnderlyingProblemShape> problem_shapes;
+  cutlass::DeviceAllocation<const ElementA*> ptr_a;
+  cutlass::DeviceAllocation<const ElementB*> ptr_b;
+  cutlass::DeviceAllocation<const ElementC*> ptr_c;
+  cutlass::DeviceAllocation<ElementC*> ptr_d;
+  cutlass::DeviceAllocation<StrideA> stride_a;
+  cutlass::DeviceAllocation<StrideB> stride_b;
+  cutlass::DeviceAllocation<StrideC> stride_c;
+  cutlass::DeviceAllocation<StrideD> stride_d;
+  cutlass::DeviceAllocation<uint8_t> workspace;
+  Gemm gemm;
 };
 
-}  // namespace
+CutlassGroupedRunnerHandle* create_cutlass_grouped_runner(
+    const void* const* a_ptrs,
+    const void* const* b_ptrs,
+    void* const* c_ptrs,
+    const int64_t* mnk_shapes,
+    int group_count,
+    int device_index,
+    cudaStream_t stream) {
+  return new CutlassGroupedRunnerHandle(
+      a_ptrs, b_ptrs, c_ptrs, mnk_shapes, group_count, device_index, stream);
+}
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  pybind11::class_<CutlassGroupedRunner>(module, "CutlassGroupedRunner")
-      .def(pybind11::init<const std::vector<torch::Tensor>&,
-                          const std::vector<torch::Tensor>&,
-                          const std::vector<torch::Tensor>&>())
-      .def("run", &CutlassGroupedRunner::run)
-      .def("metadata", &CutlassGroupedRunner::metadata);
+void destroy_cutlass_grouped_runner(CutlassGroupedRunnerHandle* runner) {
+  delete runner;
+}
+
+void run_cutlass_grouped_runner(CutlassGroupedRunnerHandle* runner, cudaStream_t stream) {
+  if (runner == nullptr) {
+    throw std::invalid_argument("CUTLASS grouped GEMM runner is null");
+  }
+  check_cutlass(runner->gemm.run(stream), "CUTLASS grouped GEMM run");
+}
+
+size_t cutlass_grouped_workspace_bytes(const CutlassGroupedRunnerHandle* runner) {
+  return runner == nullptr ? 0 : runner->workspace_size;
 }
