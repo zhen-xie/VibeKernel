@@ -4,25 +4,13 @@ from dataclasses import dataclass
 
 import torch
 
-# One MoE FFN "up" projection. A batch of 512 tokens with top-2 routing
-# creates 1,024 expert-token assignments. This 32-expert distribution is both
-# realistic for sparse routing and deliberately skewed: its 4..112 token
-# range supplies many short GEMMs for a persistent grouped scheduler.
-EXPERT_TOKEN_COUNTS = (
-    4, 4, 4, 4,
-    8, 8, 8, 8,
-    12, 12, 12, 12,
-    16, 16, 16, 16,
-    24, 24, 24, 24,
-    32, 32, 32, 32,
-    48, 48, 48, 48,
-    112, 112, 112, 112,
-)
-NUM_INPUT_TOKENS = 512
-TOP_K = 2
+# The original eight-problem irregular GEMM microbenchmark.  The small and
+# unequal M dimensions expose launch and scheduling costs independently of a
+# full MoE model's routing and weight-memory footprint.
+EXPERT_TOKEN_COUNTS = (4, 8, 16, 32, 4, 48, 8, 64)
 NUM_EXPERTS = len(EXPERT_TOKEN_COUNTS)
-K = 4096       # model hidden size
-N = 14336      # MoE FFN expansion size
+K = 4096
+N = 4096
 
 
 @dataclass(frozen=True)
@@ -53,10 +41,8 @@ def total_flops(problems: list[GemmProblem]) -> int:
 
 def description(problems: list[GemmProblem]) -> dict[str, object]:
     return {
-        "name": "moe_ffn_up_projection_grouped_gemm",
+        "name": "eight_irregular_gemms",
         "num_experts": NUM_EXPERTS,
-        "input_tokens": NUM_INPUT_TOKENS,
-        "top_k": TOP_K,
         "expert_token_counts": [p.m for p in problems],
         "total_expert_token_assignments": sum(p.m for p in problems),
         "m": [p.m for p in problems],
