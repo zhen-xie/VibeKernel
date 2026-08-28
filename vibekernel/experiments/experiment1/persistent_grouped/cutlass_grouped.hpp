@@ -3,7 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <cuda_runtime_api.h>
+// Keep this header consumable by the host C++ compiler without requiring a
+// CUDA toolkit include path. CUDA's runtime API defines this same opaque
+// handle as a pointer to CUstream_st.
+struct CUstream_st;
+using cudaStream_t = CUstream_st*;
 
 struct CutlassGroupedRunnerHandle;
 
