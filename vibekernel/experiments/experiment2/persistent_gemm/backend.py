@@ -1,0 +1,3 @@
+from vibekernel.experiments.experiment1.persistent_grouped.backend import PersistentGroupedBackend
+class PersistentLargeBackend(PersistentGroupedBackend):
+ name='persistent_gemm'
