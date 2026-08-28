@@ -6,9 +6,12 @@ import triton.language as tl
 
 @triton.jit
 def grouped_gemm_kernel(
-    a_ptrs,
-    b_ptrs,
-    c_ptrs,
+    a_base,
+    b_base,
+    c_base,
+    a_group_offsets,
+    b_group_offsets,
+    c_group_offsets,
     m_sizes,
     task_gemm_ids,
     task_tile_ms,
@@ -25,9 +28,9 @@ def grouped_gemm_kernel(
     tile_n = tl.load(task_tile_ns + task_id)
     m = tl.load(m_sizes + gemm_id)
 
-    a_base = tl.load(a_ptrs + gemm_id)
-    b_base = tl.load(b_ptrs + gemm_id)
-    c_base = tl.load(c_ptrs + gemm_id)
+    a_group_offset = tl.load(a_group_offsets + gemm_id)
+    b_group_offset = tl.load(b_group_offsets + gemm_id)
+    c_group_offset = tl.load(c_group_offsets + gemm_id)
 
     rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -38,9 +41,9 @@ def grouped_gemm_kernel(
         k_offsets = k0 + ks
         a_offsets = rows[:, None] * K + k_offsets[None, :]
         b_offsets = k_offsets[:, None] * N + cols[None, :]
-        a = tl.load(a_base + a_offsets, mask=(rows[:, None] < m) & (k_offsets[None, :] < K), other=0.0)
-        b = tl.load(b_base + b_offsets, mask=(k_offsets[:, None] < K) & (cols[None, :] < N), other=0.0)
+        a = tl.load(a_base + a_group_offset + a_offsets, mask=(rows[:, None] < m) & (k_offsets[None, :] < K), other=0.0)
+        b = tl.load(b_base + b_group_offset + b_offsets, mask=(k_offsets[:, None] < K) & (cols[None, :] < N), other=0.0)
         accumulator += tl.dot(a, b)
 
     c_offsets = rows[:, None] * N + cols[None, :]
-    tl.store(c_base + c_offsets, accumulator, mask=(rows[:, None] < m) & (cols[None, :] < N))
+    tl.store(c_base + c_group_offset + c_offsets, accumulator, mask=(rows[:, None] < m) & (cols[None, :] < N))
