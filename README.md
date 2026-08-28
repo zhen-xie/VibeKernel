@@ -1,14 +1,18 @@
 # VibeKernel
 
-Experiment 1 compares three complete execution strategies for eight irregular
-BF16 GEMMs on an NVIDIA H100:
+Experiment 1 compares three complete execution strategies for a BF16 MoE FFN
+up-projection grouped GEMM on an NVIDIA H100:
 
 1. cuBLASLt-backed PyTorch matmuls captured in a multi-stream CUDA Graph.
 2. A single Triton grouped-GEMM kernel.
 3. CUTLASS 3.x Hopper Persistent Grouped GEMM with device-side scheduling.
 
-The workload is `M=[4,8,16,32,4,48,8,64]`, `K=N=4096`. Inputs are BF16 and
-accumulation is FP32.
+The workload models 512 input tokens routed top-2 to eight experts (1,024
+expert-token assignments). The intentionally skewed expert loads are
+`M=[8,24,48,80,112,160,240,352]`; each expert computes
+`X_e[M,4096] @ W_e[4096,14336]`. This represents the first, expanding FFN
+projection of an MoE block. Inputs and outputs are BF16 and accumulation is
+FP32.
 
 ## H100 setup
 
