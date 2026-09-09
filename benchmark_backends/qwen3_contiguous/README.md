@@ -31,6 +31,10 @@ python benchmark_backends/qwen3_contiguous/run_pytorch.py \
 not dominated by the LM head. Add `--vocab-size 151936` to include the full
 Qwen3-8B LM-head cost.
 
+Append `--breakdown` to print CUDA-Event timings for the logical stages of one
+prefill and one decode. This is diagnostic output, not the headline benchmark:
+the main p50/p90 timing is measured separately without profiler events.
+
 The next implementations use the same `prefill`, `decode`, and `reset_cache`
 interface.  Mirage-MPK needs a dedicated contiguous-GQA attention task or
 adapter: the production Qwen3 builder is paged-KV based and is deliberately

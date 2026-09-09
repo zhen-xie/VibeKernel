@@ -3,17 +3,34 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from typing import Callable, Optional, TypeVar
 
 from common import ContiguousKVCache, Qwen3BenchmarkConfig, Qwen3Weights, build_rope_table, rms_norm
+
+
+T = TypeVar("T")
 
 
 class PyTorchBackend:
     name = "pytorch-eager"
 
-    def __init__(self, cfg: Qwen3BenchmarkConfig, weights: Qwen3Weights, batch: int) -> None:
+    def __init__(
+        self,
+        cfg: Qwen3BenchmarkConfig,
+        weights: Qwen3Weights,
+        batch: int,
+        profiler: Optional[Callable[[str, Callable[[], T]], T]] = None,
+    ) -> None:
         self.cfg, self.weights, self.batch = cfg, weights, batch
         self.cache = ContiguousKVCache(cfg, batch, weights.embedding.device, weights.embedding.dtype)
         self.cos, self.sin = build_rope_table(cfg, weights.embedding.device, weights.embedding.dtype)
+        self.profiler = profiler
+        self.phase = "run"
+
+    def _measure(self, name: str, fn: Callable[[], T]) -> T:
+        if self.profiler is None:
+            return fn()
+        return self.profiler(f"{self.phase}/{name}", fn)
 
     def reset_cache(self) -> None:
         self.cache.reset()
@@ -41,40 +58,46 @@ class PyTorchBackend:
     def _layer(self, x: torch.Tensor, layer_id: int, causal: bool) -> torch.Tensor:
         c, w = self.cfg, self.weights.layers[layer_id]
         residual = x
-        h = rms_norm(x, w.input_norm, c.rms_norm_eps)
-        qkv = F.linear(h, w.qkv)
+        h = self._measure("input_rmsnorm", lambda: rms_norm(x, w.input_norm, c.rms_norm_eps))
+        qkv = self._measure("qkv_gemm", lambda: F.linear(h, w.qkv))
         q, k, v = qkv.split((c.hidden_size, c.kv_size, c.kv_size), dim=-1)
         b, s, _ = q.shape
-        q = rms_norm(q.view(b, s, c.num_attention_heads, c.head_dim), w.q_norm, c.rms_norm_eps).transpose(1, 2)
-        k = rms_norm(k.view(b, s, c.num_key_value_heads, c.head_dim), w.k_norm, c.rms_norm_eps).transpose(1, 2)
+        def norm_qk():
+            q_out = rms_norm(q.view(b, s, c.num_attention_heads, c.head_dim), w.q_norm, c.rms_norm_eps).transpose(1, 2)
+            k_out = rms_norm(k.view(b, s, c.num_key_value_heads, c.head_dim), w.k_norm, c.rms_norm_eps).transpose(1, 2)
+            return q_out, k_out
+        q, k = self._measure("qk_rmsnorm", norm_qk)
         v = v.view(b, s, c.num_key_value_heads, c.head_dim).transpose(1, 2)
         past = self.cache.length
-        q, k = self._rope(q, k, past)
-        k_all, v_all, _ = self.cache.append(layer_id, k, v)
-        attn = self._attention(q, k_all, v_all, past, causal).transpose(1, 2).reshape(b, s, c.hidden_size)
-        x = residual + F.linear(attn, w.o_proj)
+        q, k = self._measure("rope", lambda: self._rope(q, k, past))
+        k_all, v_all, _ = self._measure("kv_cache_write", lambda: self.cache.append(layer_id, k, v))
+        attn = self._measure("attention", lambda: self._attention(q, k_all, v_all, past, causal)).transpose(1, 2).reshape(b, s, c.hidden_size)
+        x = self._measure("o_gemm_residual", lambda: residual + F.linear(attn, w.o_proj))
         residual = x
-        h = rms_norm(x, w.post_norm, c.rms_norm_eps)
-        gate, up = F.linear(h, w.gate_up).chunk(2, dim=-1)
-        return residual + F.linear(F.silu(gate) * up, w.down)
+        h = self._measure("post_rmsnorm", lambda: rms_norm(x, w.post_norm, c.rms_norm_eps))
+        gate, up = self._measure("gateup_gemm", lambda: F.linear(h, w.gate_up)).chunk(2, dim=-1)
+        mlp = self._measure("silu_mul", lambda: F.silu(gate) * up)
+        return self._measure("down_gemm_residual", lambda: residual + F.linear(mlp, w.down))
 
     @torch.no_grad()
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
+        self.phase = "prefill"
         self.reset_cache()
-        x = F.embedding(input_ids, self.weights.embedding)
+        x = self._measure("embedding", lambda: F.embedding(input_ids, self.weights.embedding))
         for layer_id in range(self.cfg.num_layers):
             x = self._layer(x, layer_id, causal=True)
         self.cache.finish_layer_stack(input_ids.shape[1])
-        x = rms_norm(x, self.weights.final_norm, self.cfg.rms_norm_eps)
-        return F.linear(x[:, -1], self.weights.lm_head)
+        x = self._measure("final_rmsnorm", lambda: rms_norm(x, self.weights.final_norm, self.cfg.rms_norm_eps))
+        return self._measure("lm_head", lambda: F.linear(x[:, -1], self.weights.lm_head))
 
     @torch.no_grad()
     def decode(self, token_ids: torch.Tensor) -> torch.Tensor:
+        self.phase = "decode"
         if token_ids.ndim == 1:
             token_ids = token_ids[:, None]
-        x = F.embedding(token_ids, self.weights.embedding)
+        x = self._measure("embedding", lambda: F.embedding(token_ids, self.weights.embedding))
         for layer_id in range(self.cfg.num_layers):
             x = self._layer(x, layer_id, causal=False)
         self.cache.finish_layer_stack(1)
-        x = rms_norm(x, self.weights.final_norm, self.cfg.rms_norm_eps)
-        return F.linear(x[:, 0], self.weights.lm_head)
+        x = self._measure("final_rmsnorm", lambda: rms_norm(x, self.weights.final_norm, self.cfg.rms_norm_eps))
+        return self._measure("lm_head", lambda: F.linear(x[:, 0], self.weights.lm_head))

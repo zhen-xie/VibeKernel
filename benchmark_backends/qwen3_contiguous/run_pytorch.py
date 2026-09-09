@@ -6,6 +6,7 @@ Usage from repository root:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import statistics
 import torch
 
@@ -32,6 +33,32 @@ def describe(values: list[float]) -> str:
     )
 
 
+class CudaBreakdown:
+    """Event-based logical-stage profiler; use only outside the main timing run."""
+
+    def __init__(self) -> None:
+        self.events = []
+
+    def __call__(self, name, fn):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = fn()
+        end.record()
+        self.events.append((name, start, end))
+        return result
+
+    def report(self) -> None:
+        if not self.events:
+            return
+        self.events[-1][2].synchronize()
+        totals = defaultdict(float)
+        for name, start, end in self.events:
+            totals[name] += start.elapsed_time(end)
+        print("logical_breakdown_ms (one representative run; profiling overhead excluded from headline timing):")
+        for name, elapsed in sorted(totals.items()):
+            print(f"  {name:<34} {elapsed:8.3f}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--batch", type=int, default=2)
@@ -43,6 +70,7 @@ def main() -> None:
                    help="LM vocabulary; use 151936 to include full Qwen3-8B LM-head cost.")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--repeats", type=int, default=50)
+    p.add_argument("--breakdown", action="store_true", help="Print one CUDA-Event logical operator breakdown.")
     args = p.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA.")
@@ -84,6 +112,12 @@ def main() -> None:
     )
     print(f"prefill_ms {describe(prefill)}")
     print(f"decode_ms  {describe(decode)}")
+    if args.breakdown:
+        profiler = CudaBreakdown()
+        profiled = PyTorchBackend(cfg, weights, args.batch, profiler=profiler)
+        profiled.prefill(prompt)
+        profiled.decode(token)
+        profiler.report()
 
 
 if __name__ == "__main__":
