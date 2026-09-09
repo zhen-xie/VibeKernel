@@ -351,6 +351,20 @@ def triton_last_token(src: torch.Tensor, batch: int, sequence: int) -> torch.Ten
     _last_token_kernel[(batch,)](src, out, S=sequence, H=h, BLOCK=triton.next_power_of_2(h), num_warps=8)
     return out
 
+@triton.jit
+def _argmax_kernel(x, out, vocab: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0); col = tl.arange(0, BLOCK)
+    vals = tl.load(x + row * vocab + col, mask=col < vocab, other=-float("inf"))
+    tl.store(out + row, tl.argmax(vals, axis=0))
+
+def triton_argmax(logits: torch.Tensor) -> torch.Tensor:
+    vocab = logits.shape[-1]
+    if vocab > 65536:
+        return torch.argmax(logits, dim=-1)
+    out = torch.empty((logits.shape[0],), device=logits.device, dtype=torch.int64)
+    _argmax_kernel[(logits.shape[0],)](logits, out, vocab=vocab, BLOCK=triton.next_power_of_2(vocab), num_warps=8)
+    return out
+
 
 class TritonBackend:
     """Reserved public interface for the pure-Triton backend.
@@ -409,3 +423,6 @@ class TritonBackend:
         for i in range(self.cfg.num_layers): x = self._layer(x, i, 1, False)
         self.cache.finish_layer_stack(1); x = self._m("final_rmsnorm", lambda: triton_rmsnorm(x, self.weights.final_norm, self.cfg.rms_norm_eps))
         return self._m("lm_head", lambda: triton_linear(x, self.weights.lm_head))
+
+    def argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._m("argmax", lambda: triton_argmax(logits))
