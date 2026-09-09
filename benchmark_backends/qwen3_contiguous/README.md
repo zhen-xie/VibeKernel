@@ -43,6 +43,10 @@ the main p50/p90 timing is measured separately without profiler events.
 report TPOT plus first/middle/final-step latency as the contiguous KV cache
 grows.
 
+Combine `--breakdown --sequence-decode` to aggregate every logical decode
+stage over the whole generated sequence. The report includes total time,
+number of calls, and average time per generated token.
+
 The next implementations use the same `prefill`, `decode`, and `reset_cache`
 interface.  Mirage-MPK needs a dedicated contiguous-GQA attention task or
 adapter: the production Qwen3 builder is paged-KV based and is deliberately

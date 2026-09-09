@@ -74,11 +74,13 @@ class CudaBreakdown:
             return
         self.events[-1][2].synchronize()
         totals = defaultdict(float)
+        counts = defaultdict(int)
         for name, start, end in self.events:
             totals[name] += start.elapsed_time(end)
-        print("logical_breakdown_ms (one representative run; profiling overhead excluded from headline timing):")
+            counts[name] += 1
+        print("logical_breakdown_ms (one representative run; separate from headline timing):")
         for name, elapsed in sorted(totals.items()):
-            print(f"  {name:<34} {elapsed:8.3f}")
+            print(f"  {name:<34} total={elapsed:8.3f} calls={counts[name]:3d} avg={elapsed / counts[name]:7.3f}")
 
 
 def main() -> None:
@@ -159,8 +161,14 @@ def main() -> None:
     if args.breakdown:
         profiler = CudaBreakdown()
         profiled = PyTorchBackend(cfg, weights, args.batch, profiler=profiler)
-        profiled.argmax(profiled.prefill(prompt))
-        profiled.argmax(profiled.decode(token))
+        profile_token = profiled.argmax(profiled.prefill(prompt))
+        if args.sequence_decode:
+            # Same cache-growth path as the sequence benchmark.  The profiler
+            # sums all identically named decode stages and reports their total.
+            for _ in range(args.decode_steps):
+                profile_token = profiled.argmax(profiled.decode(profile_token))
+        else:
+            profiled.argmax(profiled.decode(token))
         profiler.report()
 
 
