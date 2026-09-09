@@ -97,6 +97,64 @@ def triton_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@triton.jit
+def _rope_kernel(x, cos, sin, out, S, D: tl.constexpr, HALF: tl.constexpr, BLOCK: tl.constexpr):
+    """Rotate one [B, head, sequence] row with Qwen's half-split RoPE."""
+    row = tl.program_id(0)
+    d = tl.arange(0, BLOCK)
+    position = row % S
+    first = tl.load(x + row * D + d, mask=d < HALF, other=0.0)
+    second = tl.load(x + row * D + HALF + d, mask=d < HALF, other=0.0)
+    c = tl.load(cos + position * D + d, mask=d < HALF, other=1.0)
+    s = tl.load(sin + position * D + d, mask=d < HALF, other=0.0)
+    tl.store(out + row * D + d, first * c - second * s, mask=d < HALF)
+    tl.store(out + row * D + HALF + d, second * c + first * s, mask=d < HALF)
+
+
+def triton_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, start: int) -> torch.Tensor:
+    """Apply precomputed RoPE to contiguous ``x[B, heads, S, head_dim]``."""
+    if x.ndim != 4 or not x.is_contiguous():
+        raise ValueError("triton_rope expects contiguous x[B, heads, S, head_dim]")
+    _, _, s, d = x.shape
+    if d % 2 or d > 512:
+        raise ValueError("reference Triton RoPE expects an even head_dim <= 512")
+    out = torch.empty_like(x)
+    _rope_kernel[(x.numel() // d,)](
+        x, cos[start:], sin[start:], out, s, D=d, HALF=d // 2,
+        BLOCK=triton.next_power_of_2(d // 2), num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _cache_write_kernel(src, cache, start, elements, S: tl.constexpr, D: tl.constexpr,
+                        MAX_T: tl.constexpr, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # p indexes src[B, KVH, S, D].  Cache is [B, KVH, MAX_T, D].
+    bh = p // (S * D)
+    within = p % (S * D)
+    position = within // D
+    column = within % D
+    cache_offset = bh * (MAX_T * D) + (start + position) * D + column
+    value = tl.load(src + p, mask=p < elements)
+    tl.store(cache + cache_offset, value, mask=p < elements)
+
+
+def triton_cache_write(src: torch.Tensor, cache: torch.Tensor, start: int) -> None:
+    """In-place append ``src[B, KVH, S, D]`` into contiguous cache history."""
+    if src.ndim != 4 or cache.ndim != 4 or not src.is_contiguous() or not cache.is_contiguous():
+        raise ValueError("triton_cache_write requires contiguous [B, heads, sequence, D] tensors")
+    b, h, s, d = src.shape
+    if cache.shape[0] != b or cache.shape[1] != h or cache.shape[3] != d:
+        raise ValueError("KV cache shape is incompatible with source")
+    if start < 0 or start + s > cache.shape[2]:
+        raise ValueError("KV cache write would exceed allocated sequence length")
+    n = src.numel()
+    _cache_write_kernel[(triton.cdiv(n, 256),)](
+        src, cache, start, n, S=s, D=d, MAX_T=cache.shape[2], BLOCK=256,
+    )
+
+
 class TritonBackend:
     """Reserved public interface for the pure-Triton backend.
 
