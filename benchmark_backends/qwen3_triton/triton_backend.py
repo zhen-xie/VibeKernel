@@ -15,7 +15,7 @@ import torch
 _REFERENCE_DIR = Path(__file__).resolve().parents[1] / "qwen3_contiguous"
 if str(_REFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(_REFERENCE_DIR))
-from common import Qwen3BenchmarkConfig, Qwen3Weights  # noqa: E402
+from common import ContiguousKVCache, Qwen3BenchmarkConfig, Qwen3Weights, build_rope_table  # noqa: E402
 
 try:
     import triton
@@ -230,6 +230,80 @@ def triton_gqa_attention(
         BLOCK_N=64, BLOCK_D=triton.next_power_of_2(d), num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _embedding_kernel(ids, table, out, H: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    token = tl.load(ids + row)
+    value = tl.load(table + token * H + col, mask=col < H, other=0.0)
+    tl.store(out + row * H + col, value, mask=col < H)
+
+
+def triton_embedding(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    ids = ids.reshape(-1)
+    h = table.shape[1]
+    out = torch.empty((ids.numel(), h), device=table.device, dtype=table.dtype)
+    _embedding_kernel[(ids.numel(),)](ids, table, out, H=h, BLOCK=triton.next_power_of_2(h), num_warps=8)
+    return out
+
+
+@triton.jit
+def _binary_kernel(a, b, out, n, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(out + p, tl.load(a + p, mask=p < n) + tl.load(b + p, mask=p < n), mask=p < n)
+
+
+def triton_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(a); n = a.numel()
+    _binary_kernel[(triton.cdiv(n, 256),)](a, b, out, n, BLOCK=256)
+    return out
+
+
+@triton.jit
+def _silu_mul_kernel(gate, up, out, n, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    g = tl.load(gate + p, mask=p < n, other=0.0).to(tl.float32)
+    u = tl.load(up + p, mask=p < n, other=0.0)
+    tl.store(out + p, (g / (1.0 + tl.exp(-g))) * u, mask=p < n)
+
+
+def triton_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(gate); n = gate.numel()
+    _silu_mul_kernel[(triton.cdiv(n, 256),)](gate, up, out, n, BLOCK=256)
+    return out
+
+
+@triton.jit
+def _copy_projection_kernel(src, dst, base, row_stride, rows, heads: tl.constexpr, S: tl.constexpr,
+                            D: tl.constexpr, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    d = p % D
+    t = p // D
+    head = t % heads
+    row = t // heads
+    batch = row // S
+    seq = row % S
+    source = row * row_stride + base + head * D + d
+    target = ((batch * heads + head) * S + seq) * D + d
+    tl.store(dst + target, tl.load(src + source, mask=p < rows * heads * D), mask=p < rows * heads * D)
+
+
+def triton_split_qkv(qkv: torch.Tensor, batch: int, seq: int, cfg: Qwen3BenchmarkConfig):
+    """Materialize Q/K/V in the head-major layout required by attention."""
+    rows, width = qkv.shape
+    assert rows == batch * seq and width == cfg.qkv_size
+    q = torch.empty((batch, cfg.num_attention_heads, seq, cfg.head_dim), device=qkv.device, dtype=qkv.dtype)
+    k = torch.empty((batch, cfg.num_key_value_heads, seq, cfg.head_dim), device=qkv.device, dtype=qkv.dtype)
+    v = torch.empty_like(k)
+    # Source row stride is qkv_size; pass it as offset to avoid any torch layout copy.
+    for dst, base in ((q, 0), (k, cfg.hidden_size), (v, cfg.hidden_size + cfg.kv_size)):
+        heads = dst.shape[1]; n = rows * heads * cfg.head_dim
+        _copy_projection_kernel[(triton.cdiv(n, 256),)](
+            qkv, dst, base, cfg.qkv_size, rows, heads=heads, S=seq, D=cfg.head_dim, BLOCK=256
+        )
+    return q, k, v
 
 
 class TritonBackend:
