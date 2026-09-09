@@ -5,9 +5,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "qwen3_paged"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import Qwen3BenchmarkConfig, Qwen3Weights
 from pytorch_backend import PyTorchBackend
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paged_backend import PagedTritonBackend
 
 
