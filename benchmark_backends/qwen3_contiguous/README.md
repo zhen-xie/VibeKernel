@@ -47,7 +47,8 @@ Combine `--breakdown --sequence-decode` to aggregate every logical decode
 stage over the whole generated sequence. The report includes total time,
 number of calls, and average time per generated token.
 
-The next implementations use the same `prefill`, `decode`, and `reset_cache`
-interface.  Mirage-MPK needs a dedicated contiguous-GQA attention task or
+The pure-Triton workstream is isolated in `../qwen3_triton/`; it imports this
+directory's shared configuration and weights but contains no PyTorch model
+compute.  Mirage-MPK needs a dedicated contiguous-GQA attention task or
 adapter: the production Qwen3 builder is paged-KV based and is deliberately
 not used as an apples-to-apples substitute here.
