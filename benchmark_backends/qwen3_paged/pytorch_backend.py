@@ -3,12 +3,17 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import importlib.util
 
 import torch
 
 REFERENCE = Path(__file__).resolve().parents[1] / "qwen3_contiguous"
-sys.path.insert(0, str(REFERENCE))
-from pytorch_backend import PyTorchBackend  # noqa: E402
+if str(REFERENCE) not in sys.path:
+    sys.path.insert(0, str(REFERENCE))
+_spec = importlib.util.spec_from_file_location("_contiguous_pytorch_backend", REFERENCE / "pytorch_backend.py")
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+PyTorchBackend = _module.PyTorchBackend
 from common import Qwen3BenchmarkConfig, Qwen3Weights  # noqa: E402
 from paged_cache import PagedKVCache
 

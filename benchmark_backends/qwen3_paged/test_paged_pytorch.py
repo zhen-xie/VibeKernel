@@ -4,10 +4,12 @@ import sys
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "qwen3_contiguous"))
+LOCAL = Path(__file__).resolve().parent
+sys.path.insert(0, str(LOCAL))
+sys.path.insert(1, str(ROOT / "qwen3_contiguous"))
 from common import Qwen3BenchmarkConfig, Qwen3Weights
 from pytorch_backend import PyTorchBackend
-from qwen3_paged.pytorch_backend import PagedPyTorchBackend
+from pytorch_backend import PagedPyTorchBackend
 
 
 def main():
