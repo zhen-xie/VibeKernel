@@ -45,12 +45,15 @@ class PagedKVCache:
         start, end = self.length, self.length + count
         if end > self.pages * self.page_size:
             raise ValueError("paged KV cache overflow")
-        for token in range(count):
-            logical = start + token
-            page_slot, in_page = divmod(logical, self.page_size)
-            page = int(self.metadata.indices[page_slot].item())
-            self.storage[layer, 0, page, in_page].copy_(k[0, :, token])
-            self.storage[layer, 1, page, in_page].copy_(v[0, :, token])
+        # One indexed GPU copy, not a Python token loop.  Calling ``.item()``
+        # per token would synchronize the CPU and turn this reference into a
+        # benchmark of Python overhead rather than paged KV storage.
+        write_positions = torch.arange(start, end, device=k.device)
+        write_slots, write_in_page = (torch.div(write_positions, self.page_size, rounding_mode="floor"),
+                                      write_positions % self.page_size)
+        write_pages = self.metadata.indices[write_slots].long()
+        self.storage[layer, 0, write_pages, write_in_page].copy_(k[0].permute(1, 0, 2))
+        self.storage[layer, 1, write_pages, write_in_page].copy_(v[0].permute(1, 0, 2))
         positions = torch.arange(end, device=k.device)
         page_slots, in_page = torch.div(positions, self.page_size, rounding_mode="floor"), positions % self.page_size
         pages = self.metadata.indices[page_slots].long()
