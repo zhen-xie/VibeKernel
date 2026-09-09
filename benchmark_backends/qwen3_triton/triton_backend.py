@@ -50,6 +50,53 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
     return out
 
 
+@triton.jit
+def _linear_kernel(
+    x, weight, out,
+    M, N, K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Compute ``out[M, N] = x[M, K] @ weight[N, K].T`` in FP32 accumulate."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        kk = k0 + tl.arange(0, BLOCK_K)
+        lhs = tl.load(
+            x + rows[:, None] * K + kk[None, :],
+            mask=(rows[:, None] < M) & (kk[None, :] < K), other=0.0,
+        )
+        # ``weight`` follows torch.nn.functional.linear's [out_features, in_features] layout.
+        rhs = tl.load(
+            weight + cols[None, :] * K + kk[:, None],
+            mask=(cols[None, :] < N) & (kk[:, None] < K), other=0.0,
+        )
+        acc += tl.dot(lhs, rhs)
+    tl.store(out + rows[:, None] * N + cols[None, :], acc,
+             mask=(rows[:, None] < M) & (cols[None, :] < N))
+
+
+def triton_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Triton equivalent of ``F.linear(x, weight)`` for contiguous 2D BF16 tensors.
+
+    A single explicit implementation is important for the benchmark: unlike
+    calling ``torch.matmul``, it cannot silently dispatch to cuBLAS/cuBLASLt.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise ValueError("triton_linear expects x[M, K] and weight[N, K]")
+    if not x.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("triton_linear requires contiguous inputs")
+    m, k, n = x.shape[0], x.shape[1], weight.shape[0]
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    _linear_kernel[(triton.cdiv(m, 16), triton.cdiv(n, 64))](
+        x, weight, out, m, n, k,
+        BLOCK_M=16, BLOCK_N=64, BLOCK_K=32, num_warps=4,
+    )
+    return out
+
+
 class TritonBackend:
     """Reserved public interface for the pure-Triton backend.
 

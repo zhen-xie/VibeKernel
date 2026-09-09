@@ -10,6 +10,6 @@ Run the current operator correctness gate on CUDA:
 CUDA_VISIBLE_DEVICES=0 python benchmark_backends/qwen3_triton/test_triton_operators.py
 ```
 
-RMSNorm is implemented and validated first.  GEMM, RoPE, KV cache write,
-causal grouped-query attention, elementwise MLP/residual, and the full
-`run_triton.py` timing entrypoint follow in that order.
+RMSNorm and the bias-free BF16 linear/GEMM used by QKV have correctness gates.
+RoPE, KV cache write, causal grouped-query attention, elementwise MLP /
+residual, and the full `run_triton.py` timing entrypoint follow in that order.
