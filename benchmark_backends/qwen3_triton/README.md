@@ -10,6 +10,6 @@ Run the current operator correctness gate on CUDA:
 CUDA_VISIBLE_DEVICES=0 python benchmark_backends/qwen3_triton/test_triton_operators.py
 ```
 
-RMSNorm, bias-free BF16 linear/GEMM, RoPE, and contiguous KV writes have
-correctness gates.  Causal grouped-query attention, elementwise MLP /
-residual, and the full `run_triton.py` timing entrypoint follow in that order.
+RMSNorm, bias-free BF16 linear/GEMM, RoPE, contiguous KV writes, and causal
+grouped-query attention have correctness gates.  Elementwise MLP / residual
+operations and the full `run_triton.py` timing entrypoint follow next.

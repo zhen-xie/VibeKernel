@@ -8,7 +8,7 @@ _REFERENCE_DIR = Path(__file__).resolve().parents[1] / "qwen3_contiguous"
 if str(_REFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(_REFERENCE_DIR))
 from common import Qwen3BenchmarkConfig, build_rope_table, rms_norm  # noqa: E402
-from triton_backend import triton_cache_write, triton_linear, triton_rmsnorm, triton_rope
+from triton_backend import triton_cache_write, triton_gqa_attention, triton_linear, triton_rmsnorm, triton_rope
 
 
 def test_rmsnorm() -> None:
@@ -58,6 +58,38 @@ def test_cache_write() -> None:
     print("PASSED: Triton KV cache write matches PyTorch reference")
 
 
+def _attention_reference(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, past: int, causal: bool) -> torch.Tensor:
+    b, qh, s, d = q.shape
+    kvh = k.shape[1]
+    grouped_q = q.view(b, kvh, qh // kvh, s, d)
+    scores = torch.einsum("bhrsd,bhtd->bhrst", grouped_q.float(), k.float()) * (d ** -0.5)
+    if causal:
+        qpos = torch.arange(past, past + s, device=q.device)[:, None]
+        kpos = torch.arange(k.shape[2], device=q.device)[None, :]
+        scores.masked_fill_(kpos > qpos, float("-inf"))
+    probs = scores.softmax(dim=-1).to(q.dtype)
+    return torch.einsum("bhrst,bhtd->bhrsd", probs, v).reshape_as(q)
+
+
+def test_gqa_attention() -> None:
+    torch.manual_seed(4)
+    # Prefill: causal rows grow from one visible key to the full sequence.
+    q = torch.randn((2, 8, 11, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 2, 11, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    actual = triton_gqa_attention(q, k, v, past=0, causal=True)
+    expected = _attention_reference(q, k, v, past=0, causal=True)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    # Decode: one query sees a pre-existing contiguous history.
+    q = torch.randn((2, 8, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 2, 16, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    actual = triton_gqa_attention(q, k, v, past=15, causal=False)
+    expected = _attention_reference(q, k, v, past=15, causal=False)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    print("PASSED: Triton GQA attention matches PyTorch reference")
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise RuntimeError("This test requires CUDA.")
@@ -65,3 +97,4 @@ if __name__ == "__main__":
     test_linear()
     test_rope()
     test_cache_write()
+    test_gqa_attention()

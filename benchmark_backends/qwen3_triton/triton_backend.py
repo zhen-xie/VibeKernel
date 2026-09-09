@@ -155,6 +155,83 @@ def triton_cache_write(src: torch.Tensor, cache: torch.Tensor, start: int) -> No
     )
 
 
+@triton.jit
+def _gqa_attention_kernel(
+    q, k, v, out,
+    HQ: tl.constexpr, HKV: tl.constexpr, S: tl.constexpr, T: tl.constexpr,
+    D: tl.constexpr, GROUP_SIZE: tl.constexpr, PAST: tl.constexpr,
+    CAUSAL: tl.constexpr, SM_SCALE: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    """One program computes one query row using online softmax over K/V."""
+    pid = tl.program_id(0)
+    d = tl.arange(0, BLOCK_D)
+    sequence = pid % S
+    tmp = pid // S
+    q_head = tmp % HQ
+    batch = tmp // HQ
+    kv_head = q_head // GROUP_SIZE
+
+    q_offset = ((batch * HQ + q_head) * S + sequence) * D
+    q_value = tl.load(q + q_offset + d, mask=d < D, other=0.0).to(tl.float32)
+    running_max = -float("inf")
+    running_sum = 0.0
+    accumulator = tl.zeros((BLOCK_D,), tl.float32)
+    # In decode, S=1 and PAST is the already-filled cache length.  In
+    # prefill, each row may attend only through PAST + its own position.
+    last_visible = PAST + sequence if CAUSAL else T - 1
+    for start_n in range(0, T, BLOCK_N):
+        n = start_n + tl.arange(0, BLOCK_N)
+        valid = n < T
+        if CAUSAL:
+            valid = valid & (n <= last_visible)
+        kv_offset = ((batch * HKV + kv_head) * T + n[:, None]) * D + d[None, :]
+        key = tl.load(k + kv_offset, mask=(n[:, None] < T) & (d[None, :] < D), other=0.0).to(tl.float32)
+        score = tl.sum(key * q_value[None, :], axis=1) * SM_SCALE
+        score = tl.where(valid, score, -float("inf"))
+        tile_max = tl.max(score, axis=0)
+        new_max = tl.maximum(running_max, tile_max)
+        probability = tl.exp(score - new_max)
+        alpha = tl.exp(running_max - new_max)
+        value = tl.load(v + kv_offset, mask=(n[:, None] < T) & (d[None, :] < D), other=0.0).to(tl.float32)
+        accumulator = accumulator * alpha + tl.sum(probability[:, None] * value, axis=0)
+        running_sum = running_sum * alpha + tl.sum(probability, axis=0)
+        running_max = new_max
+    out_offset = ((batch * HQ + q_head) * S + sequence) * D
+    tl.store(out + out_offset + d, accumulator / running_sum, mask=d < D)
+
+
+def triton_gqa_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, past: int, causal: bool
+) -> torch.Tensor:
+    """Causal/non-causal grouped-query attention over a contiguous KV cache.
+
+    ``q`` is ``[B, QH, S, D]`` and K/V are ``[B, KVH, T, D]``.  K/V heads
+    are grouped logically inside the kernel; no repeat-interleave materializes
+    the GQA expansion.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape:
+        raise ValueError("attention expects q[B,QH,S,D], k/v[B,KVH,T,D]")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("Triton attention requires contiguous Q/K/V")
+    b, qh, s, d = q.shape
+    bk, kvh, t, kd = k.shape
+    if bk != b or kd != d or qh % kvh:
+        raise ValueError("incompatible GQA dimensions")
+    if d > 256 or t > 4096:
+        raise ValueError("reference Triton attention supports D <= 256 and T <= 4096")
+    if past < 0 or (causal and past + s > t):
+        raise ValueError("invalid cache length for causal attention")
+    out = torch.empty_like(q)
+    _gqa_attention_kernel[(b * qh * s,)](
+        q, k, v, out,
+        HQ=qh, HKV=kvh, S=s, T=t, D=d, GROUP_SIZE=qh // kvh,
+        PAST=past, CAUSAL=causal, SM_SCALE=d ** -0.5,
+        BLOCK_N=64, BLOCK_D=triton.next_power_of_2(d), num_warps=4,
+    )
+    return out
+
+
 class TritonBackend:
     """Reserved public interface for the pure-Triton backend.
 
