@@ -5,8 +5,7 @@ import torch
 import torch.nn.functional as F
 from typing import Callable, Optional, TypeVar
 
-from common import Qwen3BenchmarkConfig, Qwen3Weights, build_rope_table, rms_norm
-from paged_cache import PagedKVCache
+from common import ContiguousKVCache, Qwen3BenchmarkConfig, Qwen3Weights, build_rope_table, rms_norm
 
 
 T = TypeVar("T")
@@ -23,13 +22,7 @@ class PyTorchBackend:
         profiler: Optional[Callable[[str, Callable[[], T]], T]] = None,
     ) -> None:
         self.cfg, self.weights, self.batch = cfg, weights, batch
-        if batch != 1:
-            raise ValueError("qwen3_paged PyTorch reference currently supports one paged request (batch=1)")
-        pages = (cfg.max_seq_len + 63) // 64
-        self.cache = PagedKVCache(
-            cfg.num_layers, pages, 64, cfg.num_key_value_heads, cfg.head_dim,
-            weights.embedding.device, weights.embedding.dtype,
-        )
+        self.cache = ContiguousKVCache(cfg, batch, weights.embedding.device, weights.embedding.dtype)
         self.cos, self.sin = build_rope_table(cfg, weights.embedding.device, weights.embedding.dtype)
         self.profiler = profiler
         self.phase = "run"

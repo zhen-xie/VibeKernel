@@ -6,10 +6,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(LOCAL))
-sys.path.insert(1, str(ROOT / "qwen3_contiguous"))
+sys.path.insert(1, str(ROOT / "qwen3_contiguous"))  # temporary semantic comparator only
 from common import Qwen3BenchmarkConfig, Qwen3Weights
-from pytorch_backend import PyTorchBackend
-from pytorch_backend import PagedPyTorchBackend
+from pytorch_backend_contiguous_reference import PyTorchBackend as ContiguousPyTorchBackend
+from pytorch_backend import PyTorchBackend as PagedPyTorchBackend
 
 
 def main():
@@ -17,7 +17,7 @@ def main():
                                num_attention_heads=8, num_key_value_heads=2, head_dim=32, max_seq_len=80)
     w = Qwen3Weights(cfg, torch.device("cuda"), torch.bfloat16, seed=9)
     x = torch.arange(70, device="cuda").reshape(1, 70) % cfg.vocab_size
-    a, b = PyTorchBackend(cfg, w, 1), PagedPyTorchBackend(cfg, w, 1, page_size=64)
+    a, b = ContiguousPyTorchBackend(cfg, w, 1), PagedPyTorchBackend(cfg, w, 1)
     torch.testing.assert_close(b.prefill(x), a.prefill(x), rtol=3e-2, atol=3e-2)
     token = torch.argmax(a.prefill(x), -1)
     torch.testing.assert_close(b.decode(token), a.decode(token), rtol=3e-2, atol=3e-2)
