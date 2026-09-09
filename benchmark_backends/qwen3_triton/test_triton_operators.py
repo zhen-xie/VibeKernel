@@ -8,7 +8,10 @@ _REFERENCE_DIR = Path(__file__).resolve().parents[1] / "qwen3_contiguous"
 if str(_REFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(_REFERENCE_DIR))
 from common import Qwen3BenchmarkConfig, build_rope_table, rms_norm  # noqa: E402
-from triton_backend import triton_cache_write, triton_gqa_attention, triton_linear, triton_rmsnorm, triton_rope
+from triton_backend import (
+    triton_add, triton_cache_write, triton_embedding, triton_gqa_attention,
+    triton_linear, triton_rmsnorm, triton_rope, triton_silu_mul, triton_split_qkv,
+)
 
 
 def test_rmsnorm() -> None:
@@ -90,6 +93,35 @@ def test_gqa_attention() -> None:
     print("PASSED: Triton GQA attention matches PyTorch reference")
 
 
+def test_elementwise_and_embedding() -> None:
+    torch.manual_seed(5)
+    table = torch.randn((101, 256), device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([[1, 99], [7, 42]], device="cuda", dtype=torch.int64)
+    torch.testing.assert_close(triton_embedding(ids, table), table[ids].reshape(-1, 256), rtol=0, atol=0)
+    gate = torch.randn((13, 768), device="cuda", dtype=torch.bfloat16)
+    up = torch.randn_like(gate)
+    torch.testing.assert_close(triton_silu_mul(gate, up), torch.nn.functional.silu(gate) * up, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(triton_add(gate, up), gate + up, rtol=0, atol=0)
+    print("PASSED: Triton embedding and elementwise kernels match PyTorch reference")
+
+
+def test_qkv_layout() -> None:
+    torch.manual_seed(6)
+    cfg = Qwen3BenchmarkConfig(hidden_size=256, intermediate_size=768, num_layers=1,
+                               num_attention_heads=8, num_key_value_heads=2, head_dim=32)
+    batch, seq = 2, 3
+    qkv = torch.randn((batch * seq, cfg.qkv_size), device="cuda", dtype=torch.bfloat16)
+    q, k, v = triton_split_qkv(qkv, batch, seq, cfg)
+    raw_q, raw_k, raw_v = qkv.split((cfg.hidden_size, cfg.kv_size, cfg.kv_size), dim=-1)
+    expected_q = raw_q.view(batch, seq, cfg.num_attention_heads, cfg.head_dim).transpose(1, 2).contiguous()
+    expected_k = raw_k.view(batch, seq, cfg.num_key_value_heads, cfg.head_dim).transpose(1, 2).contiguous()
+    expected_v = raw_v.view(batch, seq, cfg.num_key_value_heads, cfg.head_dim).transpose(1, 2).contiguous()
+    torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(k, expected_k, rtol=0, atol=0)
+    torch.testing.assert_close(v, expected_v, rtol=0, atol=0)
+    print("PASSED: Triton QKV split/layout matches PyTorch reference")
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise RuntimeError("This test requires CUDA.")
@@ -98,3 +130,5 @@ if __name__ == "__main__":
     test_rope()
     test_cache_write()
     test_gqa_attention()
+    test_elementwise_and_embedding()
+    test_qkv_layout()
