@@ -158,7 +158,7 @@ def triton_cache_write(src: torch.Tensor, cache: torch.Tensor, start: int) -> No
 @triton.jit
 def _gqa_attention_kernel(
     q, k, v, out,
-    HQ: tl.constexpr, HKV: tl.constexpr, S: tl.constexpr, T: tl.constexpr,
+    HQ: tl.constexpr, HKV: tl.constexpr, S: tl.constexpr, T: tl.constexpr, CACHE_T: tl.constexpr,
     D: tl.constexpr, GROUP_SIZE: tl.constexpr, PAST: tl.constexpr,
     CAUSAL: tl.constexpr, SM_SCALE: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -185,7 +185,7 @@ def _gqa_attention_kernel(
         valid = n < T
         if CAUSAL:
             valid = valid & (n <= last_visible)
-        kv_offset = ((batch * HKV + kv_head) * T + n[:, None]) * D + d[None, :]
+        kv_offset = ((batch * HKV + kv_head) * CACHE_T + n[:, None]) * D + d[None, :]
         key = tl.load(k + kv_offset, mask=(n[:, None] < T) & (d[None, :] < D), other=0.0).to(tl.float32)
         score = tl.sum(key * q_value[None, :], axis=1) * SM_SCALE
         score = tl.where(valid, score, -float("inf"))
@@ -202,7 +202,7 @@ def _gqa_attention_kernel(
 
 
 def triton_gqa_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, past: int, causal: bool
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, past: int, causal: bool, length: int | None = None
 ) -> torch.Tensor:
     """Causal/non-causal grouped-query attention over a contiguous KV cache.
 
@@ -215,17 +215,18 @@ def triton_gqa_attention(
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Triton attention requires contiguous Q/K/V")
     b, qh, s, d = q.shape
-    bk, kvh, t, kd = k.shape
+    bk, kvh, cache_t, kd = k.shape
+    t = cache_t if length is None else length
     if bk != b or kd != d or qh % kvh:
         raise ValueError("incompatible GQA dimensions")
-    if d > 256 or t > 4096:
+    if d > 256 or t > cache_t or t > 4096:
         raise ValueError("reference Triton attention supports D <= 256 and T <= 4096")
     if past < 0 or (causal and past + s > t):
         raise ValueError("invalid cache length for causal attention")
     out = torch.empty_like(q)
     _gqa_attention_kernel[(b * qh * s,)](
         q, k, v, out,
-        HQ=qh, HKV=kvh, S=s, T=t, D=d, GROUP_SIZE=qh // kvh,
+        HQ=qh, HKV=kvh, S=s, T=t, CACHE_T=cache_t, D=d, GROUP_SIZE=qh // kvh,
         PAST=past, CAUSAL=causal, SM_SCALE=d ** -0.5,
         BLOCK_N=64, BLOCK_D=triton.next_power_of_2(d), num_warps=4,
     )
@@ -306,6 +307,51 @@ def triton_split_qkv(qkv: torch.Tensor, batch: int, seq: int, cfg: Qwen3Benchmar
     return q, k, v
 
 
+@triton.jit
+def _heads_to_rows_kernel(src, dst, n, HQ: tl.constexpr, S: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    d = p % D; t = p // D; h = t % HQ; row = t // HQ; b = row // S; s = row % S
+    source = ((b * HQ + h) * S + s) * D + d
+    target = (row * HQ + h) * D + d
+    tl.store(dst + target, tl.load(src + source, mask=p < n), mask=p < n)
+
+
+def triton_heads_to_rows(src: torch.Tensor) -> torch.Tensor:
+    b, h, s, d = src.shape; n = src.numel()
+    out = torch.empty((b * s, h * d), device=src.device, dtype=src.dtype)
+    _heads_to_rows_kernel[(triton.cdiv(n, 256),)](src, out, n, HQ=h, S=s, D=d, BLOCK=256)
+    return out
+
+
+@triton.jit
+def _split_halves_kernel(src, left, right, rows, width: tl.constexpr, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = p // width; col = p % width
+    tl.store(left + p, tl.load(src + row * (2 * width) + col, mask=p < rows * width), mask=p < rows * width)
+    tl.store(right + p, tl.load(src + row * (2 * width) + width + col, mask=p < rows * width), mask=p < rows * width)
+
+
+def triton_split_halves(src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, doubled = src.shape; width = doubled // 2
+    left, right = torch.empty((rows, width), device=src.device, dtype=src.dtype), torch.empty((rows, width), device=src.device, dtype=src.dtype)
+    _split_halves_kernel[(triton.cdiv(rows * width, 256),)](src, left, right, rows, width=width, BLOCK=256)
+    return left, right
+
+
+@triton.jit
+def _last_token_kernel(src, out, S: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr):
+    b = tl.program_id(0); h = tl.arange(0, BLOCK)
+    tl.store(out + b * H + h, tl.load(src + (b * S + S - 1) * H + h, mask=h < H), mask=h < H)
+
+
+def triton_last_token(src: torch.Tensor, batch: int, sequence: int) -> torch.Tensor:
+    """Gather final hidden state from contiguous rows ``[B*S, H]``."""
+    h = src.shape[1]
+    out = torch.empty((batch, h), device=src.device, dtype=src.dtype)
+    _last_token_kernel[(batch,)](src, out, S=sequence, H=h, BLOCK=triton.next_power_of_2(h), num_warps=8)
+    return out
+
+
 class TritonBackend:
     """Reserved public interface for the pure-Triton backend.
 
@@ -324,9 +370,42 @@ class TritonBackend:
         profiler: Optional[Callable[[str, Callable[[], T]], T]] = None,
     ) -> None:
         self.cfg, self.weights, self.batch, self.profiler = cfg, weights, batch, profiler
+        self.cache = ContiguousKVCache(cfg, batch, weights.embedding.device, weights.embedding.dtype)
+        self.cos, self.sin = build_rope_table(cfg, weights.embedding.device, weights.embedding.dtype)
+        self.phase = "run"
+
+    def _m(self, name, fn):
+        return fn() if self.profiler is None else self.profiler(f"{self.phase}/{name}", fn)
+
+    def _layer(self, x, layer_id, sequence, causal):
+        c, w = self.cfg, self.weights.layers[layer_id]; residual = x
+        h = self._m("input_rmsnorm", lambda: triton_rmsnorm(x, w.input_norm, c.rms_norm_eps))
+        qkv = self._m("qkv_gemm", lambda: triton_linear(h, w.qkv))
+        q, k, v = triton_split_qkv(qkv, self.batch, sequence, c)
+        q = self._m("qk_rmsnorm", lambda: triton_rmsnorm(q, w.q_norm, c.rms_norm_eps))
+        k = triton_rmsnorm(k, w.k_norm, c.rms_norm_eps)
+        past = self.cache.length
+        q = self._m("rope", lambda: triton_rope(q, self.cos, self.sin, past))
+        k = triton_rope(k, self.cos, self.sin, past)
+        kc, vc = self.cache.storage[layer_id, 0], self.cache.storage[layer_id, 1]
+        self._m("kv_cache_write", lambda: (triton_cache_write(k, kc, past), triton_cache_write(v, vc, past)))
+        attn = self._m("attention", lambda: triton_gqa_attention(q, kc, vc, past=past, causal=causal, length=past + sequence))
+        attn = triton_heads_to_rows(attn)
+        x = self._m("o_gemm_residual", lambda: triton_add(residual, triton_linear(attn, w.o_proj)))
+        residual = x; h = self._m("post_rmsnorm", lambda: triton_rmsnorm(x, w.post_norm, c.rms_norm_eps))
+        gu = self._m("gateup_gemm", lambda: triton_linear(h, w.gate_up)); gate, up = triton_split_halves(gu)
+        mlp = self._m("silu_mul", lambda: triton_silu_mul(gate, up))
+        return self._m("down_gemm_residual", lambda: triton_add(residual, triton_linear(mlp, w.down)))
 
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Triton prefill is enabled after the operator-validation milestone.")
+        self.phase = "prefill"; self.cache.reset(); s = input_ids.shape[1]
+        x = self._m("embedding", lambda: triton_embedding(input_ids, self.weights.embedding))
+        for i in range(self.cfg.num_layers): x = self._layer(x, i, s, True)
+        self.cache.finish_layer_stack(s); x = self._m("final_rmsnorm", lambda: triton_rmsnorm(x, self.weights.final_norm, self.cfg.rms_norm_eps))
+        return self._m("lm_head", lambda: triton_linear(triton_last_token(x, self.batch, s), self.weights.lm_head))
 
     def decode(self, token_ids: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Triton decode is enabled after the operator-validation milestone.")
+        self.phase = "decode"; x = self._m("embedding", lambda: triton_embedding(token_ids, self.weights.embedding))
+        for i in range(self.cfg.num_layers): x = self._layer(x, i, 1, False)
+        self.cache.finish_layer_stack(1); x = self._m("final_rmsnorm", lambda: triton_rmsnorm(x, self.weights.final_norm, self.cfg.rms_norm_eps))
+        return self._m("lm_head", lambda: triton_linear(x, self.weights.lm_head))

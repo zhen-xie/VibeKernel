@@ -8,6 +8,9 @@ _REFERENCE_DIR = Path(__file__).resolve().parents[1] / "qwen3_contiguous"
 if str(_REFERENCE_DIR) not in sys.path:
     sys.path.insert(0, str(_REFERENCE_DIR))
 from common import Qwen3BenchmarkConfig, build_rope_table, rms_norm  # noqa: E402
+from common import Qwen3Weights
+from pytorch_backend import PyTorchBackend
+from triton_backend import TritonBackend
 from triton_backend import (
     triton_add, triton_cache_write, triton_embedding, triton_gqa_attention,
     triton_linear, triton_rmsnorm, triton_rope, triton_silu_mul, triton_split_qkv,
@@ -122,6 +125,20 @@ def test_qkv_layout() -> None:
     print("PASSED: Triton QKV split/layout matches PyTorch reference")
 
 
+def test_end_to_end() -> None:
+    cfg = Qwen3BenchmarkConfig(vocab_size=257, hidden_size=256, intermediate_size=768,
+                               num_layers=1, num_attention_heads=8, num_key_value_heads=2,
+                               head_dim=32, max_seq_len=16)
+    weights = Qwen3Weights(cfg, torch.device("cuda"), torch.bfloat16, seed=7)
+    prompt = torch.tensor([[3, 8, 13, 21], [5, 34, 55, 89]], device="cuda")
+    reference, actual = PyTorchBackend(cfg, weights, 2), TritonBackend(cfg, weights, 2)
+    ref_logits, tri_logits = reference.prefill(prompt), actual.prefill(prompt)
+    torch.testing.assert_close(tri_logits, ref_logits, rtol=6e-2, atol=6e-2)
+    token = torch.argmax(ref_logits, dim=-1)
+    torch.testing.assert_close(actual.decode(token), reference.decode(token), rtol=6e-2, atol=6e-2)
+    print("PASSED: Triton end-to-end prefill and decode match PyTorch reference")
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise RuntimeError("This test requires CUDA.")
@@ -132,3 +149,4 @@ if __name__ == "__main__":
     test_gqa_attention()
     test_elementwise_and_embedding()
     test_qkv_layout()
+    test_end_to_end()
