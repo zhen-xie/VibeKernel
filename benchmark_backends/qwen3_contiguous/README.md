@@ -38,6 +38,11 @@ Append `--breakdown` to print CUDA-Event timings for the logical stages of one
 prefill and one decode. This is diagnostic output, not the headline benchmark:
 the main p50/p90 timing is measured separately without profiler events.
 
+`decode_ms` is a fixed-context, one-token microbenchmark. Add
+`--sequence-decode` to generate `--decode-steps` tokens autoregressively and
+report TPOT plus first/middle/final-step latency as the contiguous KV cache
+grows.
+
 The next implementations use the same `prefill`, `decode`, and `reset_cache`
 interface.  Mirage-MPK needs a dedicated contiguous-GQA attention task or
 adapter: the production Qwen3 builder is paged-KV based and is deliberately

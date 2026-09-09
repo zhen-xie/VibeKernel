@@ -33,6 +33,28 @@ def describe(values: list[float]) -> str:
     )
 
 
+def sequence_decode_ms(backend, prompt: torch.Tensor, decode_steps: int, repeats: int) -> tuple[list[list[float]], list[float]]:
+    """Measure a real autoregressive sequence; cache length grows every step."""
+    per_step = [[] for _ in range(decode_steps)]
+    sequence_totals = []
+    for _ in range(repeats):
+        token = backend.argmax(backend.prefill(prompt))
+        whole_start, whole_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(decode_steps)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(decode_steps)]
+        whole_start.record()
+        for step in range(decode_steps):
+            starts[step].record()
+            token = backend.argmax(backend.decode(token))
+            ends[step].record()
+        whole_end.record()
+        whole_end.synchronize()
+        sequence_totals.append(whole_start.elapsed_time(whole_end))
+        for step in range(decode_steps):
+            per_step[step].append(starts[step].elapsed_time(ends[step]))
+    return per_step, sequence_totals
+
+
 class CudaBreakdown:
     """Event-based logical-stage profiler; use only outside the main timing run."""
 
@@ -71,6 +93,8 @@ def main() -> None:
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--repeats", type=int, default=50)
     p.add_argument("--breakdown", action="store_true", help="Print one CUDA-Event logical operator breakdown.")
+    p.add_argument("--sequence-decode", action="store_true",
+                   help="Also measure a real autoregressive sequence of --decode-steps tokens.")
     args = p.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA.")
@@ -95,6 +119,12 @@ def main() -> None:
     for _ in range(args.warmup):
         backend.argmax(backend.prefill(prompt))
         backend.argmax(backend.decode(token))
+    if args.sequence_decode:
+        # Warm every context length that the sequence benchmark will exercise.
+        for _ in range(args.warmup):
+            warm_token = backend.argmax(backend.prefill(prompt))
+            for _ in range(args.decode_steps):
+                warm_token = backend.argmax(backend.decode(warm_token))
     torch.cuda.synchronize()
     prefill = time_ms(lambda: backend.argmax(backend.prefill(prompt)), args.repeats)
     # Rebuild the same prompt cache before every decode sample.  Prefill is
@@ -113,6 +143,19 @@ def main() -> None:
     )
     print(f"prefill_ms {describe(prefill)}")
     print(f"decode_ms  {describe(decode)}")
+    if args.sequence_decode:
+        # Sequence timing is intentionally separate from fixed-context decode_ms.
+        # It reveals attention/KV-cache scaling as T grows from S to S+N-1.
+        step_ms, sequence_ms = sequence_decode_ms(backend, prompt, args.decode_steps, args.repeats)
+        print(
+            f"decode_sequence_ms tokens={args.decode_steps} "
+            f"total({describe(sequence_ms)}) "
+            f"tpot_p50={statistics.median(sequence_ms) / args.decode_steps:.3f}"
+        )
+        selected = sorted({0, 1, args.decode_steps // 2, args.decode_steps - 1})
+        for step in selected:
+            context = args.prompt_len + step
+            print(f"  step={step + 1:4d} context={context:5d} {describe(step_ms[step])}")
     if args.breakdown:
         profiler = CudaBreakdown()
         profiled = PyTorchBackend(cfg, weights, args.batch, profiler=profiler)
