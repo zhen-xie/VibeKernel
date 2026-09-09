@@ -93,9 +93,10 @@ def main() -> None:
     prompt = torch.randint(cfg.vocab_size, (args.batch, args.prompt_len), device=device)
     token = torch.randint(cfg.vocab_size, (args.batch,), device=device)
     for _ in range(args.warmup):
-        backend.prefill(prompt); backend.decode(token)
+        backend.argmax(backend.prefill(prompt))
+        backend.argmax(backend.decode(token))
     torch.cuda.synchronize()
-    prefill = time_ms(lambda: backend.prefill(prompt), args.repeats)
+    prefill = time_ms(lambda: backend.argmax(backend.prefill(prompt)), args.repeats)
     # Rebuild the same prompt cache before every decode sample.  Prefill is
     # deliberately outside the CUDA Event interval: this measures one decode
     # token at one fixed context length, not an ever-growing sequence.
@@ -103,7 +104,7 @@ def main() -> None:
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     for _ in range(args.repeats):
         backend.prefill(prompt)
-        start.record(); backend.decode(token); end.record(); end.synchronize()
+        start.record(); backend.argmax(backend.decode(token)); end.record(); end.synchronize()
         decode.append(start.elapsed_time(end))
     print(
         f"backend={backend.name} preset={args.preset} layers={cfg.num_layers} "
@@ -115,8 +116,8 @@ def main() -> None:
     if args.breakdown:
         profiler = CudaBreakdown()
         profiled = PyTorchBackend(cfg, weights, args.batch, profiler=profiler)
-        profiled.prefill(prompt)
-        profiled.decode(token)
+        profiled.argmax(profiled.prefill(prompt))
+        profiled.argmax(profiled.decode(token))
         profiler.report()
 
 

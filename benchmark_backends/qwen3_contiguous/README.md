@@ -13,6 +13,9 @@ shared contract for the planned Triton and Mirage-MPK backends:
 - in-place cache writes; and
 - RoPE table precomputed once per backend.
 
+Headline timings are token-ready: they include the final `argmax` after the
+LM head rather than stopping at logits.
+
 Run on CUDA:
 
 ```bash

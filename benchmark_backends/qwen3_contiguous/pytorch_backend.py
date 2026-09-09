@@ -101,3 +101,7 @@ class PyTorchBackend:
         self.cache.finish_layer_stack(1)
         x = self._measure("final_rmsnorm", lambda: rms_norm(x, self.weights.final_norm, self.cfg.rms_norm_eps))
         return self._measure("lm_head", lambda: F.linear(x[:, 0], self.weights.lm_head))
+
+    def argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """Final token selection, explicit so every backend measures it alike."""
+        return self._measure("argmax", lambda: torch.argmax(logits, dim=-1))
