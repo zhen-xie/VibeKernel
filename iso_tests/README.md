@@ -46,7 +46,9 @@ CUDA_VISIBLE_DEVICES=0 ./build/iso_tests/02_independent_tasks/independent_tasks 
 ## 03: independent GEMM tasks
 
 Each task is a one-CTA FP32 GEMM, `C_task[M,N] = A_task[M,K] × B[K,N]`. Tasks
-share B but write disjoint C slices, so they have no data dependency.
+share B but write disjoint C slices, so they have no data dependency. In
+addition to the hand-written CUDA/Graph/MPK runners, this test reports a loop
+of `cublasSgemm` calls and one `cublasSgemmBatched` call.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./build/iso_tests/03_independent_gemm_tasks/independent_gemm_tasks \

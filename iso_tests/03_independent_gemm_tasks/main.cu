@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #define CUDA_CHECK(expr) do { cudaError_t const e = (expr); if (e != cudaSuccess) throw std::runtime_error(std::string(#expr) + ": " + cudaGetErrorString(e)); } while (0)
+#define CUBLAS_CHECK(expr) do { cublasStatus_t const s = (expr); if (s != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string(#expr) + " failed with status " + std::to_string(static_cast<int>(s))); } while (0)
 
 // One CTA computes one independent C_task[M, N] = A_task[M, K] * B[K, N].
 // The simple FP32 body is intentionally shared verbatim by all three runners.
@@ -70,6 +72,27 @@ void run_baseline(float const* a, float const* b, float* c, Options const& o) {
   CUDA_CHECK(cudaGetLastError());
 }
 
+// cuBLAS uses column-major storage.  Treating row-major C=A*B as the
+// column-major transpose C^T=B^T*A^T gives the argument order below.
+void run_cublas_loop(cublasHandle_t handle, float const* a, float const* b,
+                     float* c, Options const& o) {
+  float const alpha = 1.0f, beta = 0.0f;
+  for (int task = 0; task < o.tasks; ++task) {
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, o.n, o.m, o.k,
+        &alpha, b, o.n, a + static_cast<size_t>(task) * o.m * o.k, o.k,
+        &beta, c + static_cast<size_t>(task) * o.m * o.n, o.n));
+  }
+}
+
+void run_cublas_batched(cublasHandle_t handle, float const* const* a_array,
+                        float const* const* b_array, float* const* c_array,
+                        Options const& o) {
+  float const alpha = 1.0f, beta = 0.0f;
+  CUBLAS_CHECK(cublasSgemmBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+      o.n, o.m, o.k, &alpha, b_array, o.n, a_array, o.k, &beta,
+      c_array, o.n, o.tasks));
+}
+
 cudaGraphExec_t build_graph(float const* a, float const* b, float* c, Options const& o) {
   cudaGraph_t graph{}; CUDA_CHECK(cudaGraphCreate(&graph, 0));
   int m = o.m, n = o.n, k = o.k;
@@ -105,11 +128,18 @@ int main(int argc, char** argv) {
     std::printf("device=%s sm_%d%d, GEMM/task=[%d,%d]x[%d,%d], tasks=%d workers=%d\n", prop.name, prop.major, prop.minor, o.m, o.k, o.k, o.n, o.tasks, workers);
     size_t const a_count = static_cast<size_t>(o.tasks) * o.m * o.k, b_count = static_cast<size_t>(o.k) * o.n, c_count = static_cast<size_t>(o.tasks) * o.m * o.n;
     std::vector<float> ha(a_count), hb(b_count); for (size_t i = 0; i < a_count; ++i) ha[i] = .001f * (static_cast<int>(i % 97) - 48); for (size_t i = 0; i < b_count; ++i) hb[i] = .001f * (static_cast<int>(i % 83) - 41);
-    float *a{}, *b{}, *bc{}, *gc{}, *mc{}; QueueState* q{}; CUDA_CHECK(cudaMalloc(&a, a_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&b, b_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&bc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&gc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&mc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&q, sizeof(QueueState)));
+    float *a{}, *b{}, *bc{}, *gc{}, *mc{}, *clc{}, *cbc{}; QueueState* q{};
+    float const** a_array{}; float const** b_array{}; float** c_array{};
+    CUDA_CHECK(cudaMalloc(&a, a_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&b, b_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&bc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&gc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&mc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&clc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&cbc, c_count * sizeof(float))); CUDA_CHECK(cudaMalloc(&q, sizeof(QueueState)));
+    CUDA_CHECK(cudaMalloc(&a_array, o.tasks * sizeof(float const*))); CUDA_CHECK(cudaMalloc(&b_array, o.tasks * sizeof(float const*))); CUDA_CHECK(cudaMalloc(&c_array, o.tasks * sizeof(float*)));
     CUDA_CHECK(cudaMemcpy(a, ha.data(), a_count * sizeof(float), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(b, hb.data(), b_count * sizeof(float), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemset(q, 0, sizeof(QueueState)));
-    cudaGraphExec_t graph = build_graph(a, b, gc, o); auto baseline = [&] { run_baseline(a, b, bc, o); }; auto graph_launch = [&] { CUDA_CHECK(cudaGraphLaunch(graph, 0)); }; auto mpk = [&] { mpk_independent_gemm_kernel<<<workers, o.m * o.n>>>(a, b, mc, o.m, o.n, o.k, o.tasks, q); CUDA_CHECK(cudaGetLastError()); };
-    baseline(); graph_launch(); mpk(); CUDA_CHECK(cudaDeviceSynchronize()); std::vector<float> hbc(c_count), hgc(c_count), hmc(c_count); CUDA_CHECK(cudaMemcpy(hbc.data(), bc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hgc.data(), gc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hmc.data(), mc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); float const ge = max_abs(hbc.data(), hgc.data(), c_count), me = max_abs(hbc.data(), hmc.data(), c_count); std::printf("correctness: graph max_abs=%g, mpk max_abs=%g\n", ge, me); if (ge != 0 || me != 0) throw std::runtime_error("backend outputs differ");
-    report("baseline <<<>>>", benchmark(baseline, o.warmup, o.repeats)); report("cudaGraphLaunch", benchmark(graph_launch, o.warmup, o.repeats)); report("mpk persistent", benchmark_mpk(mpk, q, o.warmup, o.repeats));
-    std::printf("Note: each task is one FP32 GEMM CTA; MPK uses only an independent-task queue.\n"); CUDA_CHECK(cudaGraphExecDestroy(graph)); CUDA_CHECK(cudaFree(a)); CUDA_CHECK(cudaFree(b)); CUDA_CHECK(cudaFree(bc)); CUDA_CHECK(cudaFree(gc)); CUDA_CHECK(cudaFree(mc)); CUDA_CHECK(cudaFree(q));
+    std::vector<float const*> h_a_array(o.tasks), h_b_array(o.tasks); std::vector<float*> h_c_array(o.tasks);
+    for (int task = 0; task < o.tasks; ++task) { h_a_array[task] = a + static_cast<size_t>(task) * o.m * o.k; h_b_array[task] = b; h_c_array[task] = cbc + static_cast<size_t>(task) * o.m * o.n; }
+    CUDA_CHECK(cudaMemcpy(a_array, h_a_array.data(), o.tasks * sizeof(float const*), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(b_array, h_b_array.data(), o.tasks * sizeof(float const*), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(c_array, h_c_array.data(), o.tasks * sizeof(float*), cudaMemcpyHostToDevice));
+    cublasHandle_t handle{}; CUBLAS_CHECK(cublasCreate(&handle)); CUBLAS_CHECK(cublasSetStream(handle, 0));
+    cudaGraphExec_t graph = build_graph(a, b, gc, o); auto baseline = [&] { run_baseline(a, b, bc, o); }; auto graph_launch = [&] { CUDA_CHECK(cudaGraphLaunch(graph, 0)); }; auto mpk = [&] { mpk_independent_gemm_kernel<<<workers, o.m * o.n>>>(a, b, mc, o.m, o.n, o.k, o.tasks, q); CUDA_CHECK(cudaGetLastError()); }; auto cublas_loop = [&] { run_cublas_loop(handle, a, b, clc, o); }; auto cublas_batched = [&] { run_cublas_batched(handle, a_array, b_array, c_array, o); };
+    baseline(); graph_launch(); mpk(); cublas_loop(); cublas_batched(); CUDA_CHECK(cudaDeviceSynchronize()); std::vector<float> hbc(c_count), hgc(c_count), hmc(c_count), hclc(c_count), hcbc(c_count); CUDA_CHECK(cudaMemcpy(hbc.data(), bc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hgc.data(), gc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hmc.data(), mc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hclc.data(), clc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hcbc.data(), cbc, c_count * sizeof(float), cudaMemcpyDeviceToHost)); float const ge = max_abs(hbc.data(), hgc.data(), c_count), me = max_abs(hbc.data(), hmc.data(), c_count), le = max_abs(hbc.data(), hclc.data(), c_count), be = max_abs(hbc.data(), hcbc.data(), c_count); std::printf("correctness: graph=%g mpk=%g cublas_loop=%g cublas_batched=%g\n", ge, me, le, be); if (ge != 0 || me != 0 || le > 1e-4f || be > 1e-4f) throw std::runtime_error("backend outputs differ");
+    report("baseline <<<>>>", benchmark(baseline, o.warmup, o.repeats)); report("cudaGraphLaunch", benchmark(graph_launch, o.warmup, o.repeats)); report("mpk persistent", benchmark_mpk(mpk, q, o.warmup, o.repeats)); report("cuBLAS loop", benchmark(cublas_loop, o.warmup, o.repeats)); report("cuBLAS batched", benchmark(cublas_batched, o.warmup, o.repeats));
+    std::printf("Note: cuBLAS uses the column-major transpose formulation; MPK uses only an independent-task queue.\n"); CUBLAS_CHECK(cublasDestroy(handle)); CUDA_CHECK(cudaGraphExecDestroy(graph)); CUDA_CHECK(cudaFree(a)); CUDA_CHECK(cudaFree(b)); CUDA_CHECK(cudaFree(bc)); CUDA_CHECK(cudaFree(gc)); CUDA_CHECK(cudaFree(mc)); CUDA_CHECK(cudaFree(clc)); CUDA_CHECK(cudaFree(cbc)); CUDA_CHECK(cudaFree(q)); CUDA_CHECK(cudaFree(a_array)); CUDA_CHECK(cudaFree(b_array)); CUDA_CHECK(cudaFree(c_array));
   } catch (std::exception const& e) { std::fprintf(stderr, "ERROR: %s\n", e.what()); return 1; }
 }
