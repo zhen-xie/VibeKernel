@@ -5,11 +5,12 @@ experiment compares three ways to execute an identical dependent task chain:
 
 1. ordinary CUDA launches (`baseline<<<...>>>` once per task),
 2. a CUDA Graph containing those same task kernels, and
-3. one standalone persistent CUDA kernel (`MPK-v0`).
+3. one standalone persistent CUDA kernel (`MPK-v1`).
 
-`MPK-v0` uses one CTA and a statically known chain.  It is an isolation test
-for launch elimination and device-side transitions, not a reproduction of
-Mirage's multi-worker dynamic scheduler.
+`MPK-v1` starts multiple persistent worker CTAs. Workers obtain tiles of the
+current task through a device-resident counter; completion of all tiles opens
+the next dependent task. It is an isolation test, not a reproduction of
+Mirage's richer multi-worker dynamic scheduler.
 
 ## Build
 

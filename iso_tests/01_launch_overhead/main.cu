@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -8,215 +7,145 @@
 #include <string>
 #include <vector>
 
-#define CUDA_CHECK(expr)                                                       \
-  do {                                                                         \
-    cudaError_t const err = (expr);                                            \
-    if (err != cudaSuccess) {                                                  \
-      throw std::runtime_error(std::string(#expr) + ": " +                    \
-                               cudaGetErrorString(err));                       \
-    }                                                                          \
-  } while (0)
+#define CUDA_CHECK(expr) do { cudaError_t const e = (expr); if (e != cudaSuccess) throw std::runtime_error(std::string(#expr) + ": " + cudaGetErrorString(e)); } while (0)
 
-// This is deliberately small.  Every backend invokes exactly this operation
-// for each task in the chain; only the dispatch mechanism changes.
 __device__ __forceinline__ float task_op(float x, int stage) {
-  float const scale = 1.0001f + 0.00001f * static_cast<float>(stage);
-  float const bias = 0.0003f * static_cast<float>(stage + 1);
-  return tanhf(fmaf(x, scale, bias));
+  return tanhf(fmaf(x, 1.0001f + 0.00001f * stage, 0.0003f * (stage + 1)));
 }
 
+// All three backends use this exact tile implementation.
 __global__ void task_kernel(float const* input, float* output, int n, int stage) {
-  for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n;
-       i += blockDim.x * gridDim.x) {
-    output[i] = task_op(input[i], stage);
-  }
+  int const i = threadIdx.x + blockIdx.x * blockDim.x;
+  if (i < n) output[i] = task_op(input[i], stage);
 }
 
-// MPK-v0: a single persistent CTA owns a fixed, dependent task chain.  This
-// is intentionally not Mirage's scheduler.  It isolates the effect of doing
-// the task transitions on device instead of re-launching CUDA kernels.
-__global__ void mpk_persistent_kernel(float const* input, float* ping,
-                                      float* pong, int n, int tasks) {
-  float const* src = input;
-  float* dst = ping;
-  for (int stage = 0; stage < tasks; ++stage) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-      dst[i] = task_op(src[i], stage);
+struct PersistentState { int next_tile, completed_tiles, stage, epoch; };
+
+// Minimal multi-CTA device scheduler. Workers claim tiles of the current
+// logical task; its last tile opens the next dependent task.
+__global__ void mpk_persistent_kernel(float const* input, float* ping, float* pong,
+                                      int n, int tasks, int tiles,
+                                      PersistentState* state, int launch_epoch) {
+  __shared__ int local_stage, local_tile;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    state->next_tile = 0; state->completed_tiles = 0; state->stage = 0;
+    __threadfence();
+    atomicExch(&state->epoch, launch_epoch);
+  }
+  while (atomicAdd(&state->epoch, 0) != launch_epoch) {}
+
+  while (true) {
+    if (threadIdx.x == 0) {
+      local_stage = atomicAdd(&state->stage, 0);
+      local_tile = local_stage < tasks ? atomicAdd(&state->next_tile, 1) : -1;
     }
     __syncthreads();
-    src = dst;
-    dst = (dst == ping) ? pong : ping;
+    if (local_stage >= tasks) return;
+    if (local_tile >= tiles) {
+      while (atomicAdd(&state->stage, 0) == local_stage) {}
+      continue;
+    }
+    float const* src = (local_stage & 1) ? ping : input;
+    float* dst = (local_stage & 1) ? pong : ping;
+    int const i = local_tile * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = task_op(src[i], local_stage);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __threadfence();
+      if (atomicAdd(&state->completed_tiles, 1) == tiles - 1) {
+        state->next_tile = 0; state->completed_tiles = 0;
+        __threadfence();
+        atomicAdd(&state->stage, 1);
+      }
+    }
+    __syncthreads();
   }
 }
 
-struct Options {
-  int elements = 4096;
-  int tasks = 20;
-  int warmup = 100;
-  int repeats = 1000;
-  int block = 256;
-};
+struct Options { int elements = 4096, tasks = 20, warmup = 100, repeats = 1000, block = 256, workers = 0; };
 
 Options parse_options(int argc, char** argv) {
-  Options options;
-  auto require_value = [&](int& i, char const* name) {
-    if (++i == argc) throw std::runtime_error(std::string("missing value for ") + name);
-    return std::atoi(argv[i]);
-  };
+  Options o;
+  auto value = [&](int& i, char const* name) { if (++i == argc) throw std::runtime_error(std::string("missing value for ") + name); return std::atoi(argv[i]); };
   for (int i = 1; i < argc; ++i) {
-    std::string const arg(argv[i]);
-    if (arg == "--elements") options.elements = require_value(i, "--elements");
-    else if (arg == "--tasks") options.tasks = require_value(i, "--tasks");
-    else if (arg == "--warmup") options.warmup = require_value(i, "--warmup");
-    else if (arg == "--repeats") options.repeats = require_value(i, "--repeats");
-    else if (arg == "--block") options.block = require_value(i, "--block");
-    else if (arg == "--help") {
-      std::printf("Usage: launch_overhead [--elements N] [--tasks N] [--warmup N] [--repeats N] [--block N]\n");
-      std::exit(0);
-    } else throw std::runtime_error("unknown option: " + arg);
+    std::string a(argv[i]);
+    if (a == "--elements") o.elements = value(i, "--elements");
+    else if (a == "--tasks") o.tasks = value(i, "--tasks");
+    else if (a == "--warmup") o.warmup = value(i, "--warmup");
+    else if (a == "--repeats") o.repeats = value(i, "--repeats");
+    else if (a == "--block") o.block = value(i, "--block");
+    else if (a == "--workers") o.workers = value(i, "--workers");
+    else if (a == "--help") { std::printf("Usage: launch_overhead [--elements N] [--tasks N] [--warmup N] [--repeats N] [--block N] [--workers N]\n"); std::exit(0); }
+    else throw std::runtime_error("unknown option: " + a);
   }
-  if (options.elements <= 0 || options.tasks <= 0 || options.warmup < 0 ||
-      options.repeats <= 0 || options.block <= 0 || options.block > 1024)
-    throw std::runtime_error("all sizes must be positive; --block must be <= 1024");
-  return options;
+  if (o.elements <= 0 || o.tasks <= 0 || o.warmup < 0 || o.repeats <= 0 || o.block <= 0 || o.block > 1024 || o.workers < 0) throw std::runtime_error("invalid size");
+  return o;
 }
-
-using Runner = void (*)();
 
 void run_baseline(float const* input, float* ping, float* pong, Options const& o) {
   int const grid = (o.elements + o.block - 1) / o.block;
-  float const* src = input;
-  float* dst = ping;
+  float const* src = input; float* dst = ping;
   for (int stage = 0; stage < o.tasks; ++stage) {
     task_kernel<<<grid, o.block>>>(src, dst, o.elements, stage);
-    src = dst;
-    dst = (dst == ping) ? pong : ping;
+    src = dst; dst = (dst == ping) ? pong : ping;
   }
   CUDA_CHECK(cudaGetLastError());
 }
 
 cudaGraphExec_t build_graph(float const* input, float* ping, float* pong, Options const& o) {
-  cudaGraph_t graph{};
-  CUDA_CHECK(cudaGraphCreate(&graph, 0));
-  std::vector<cudaGraphNode_t> nodes;
-  nodes.reserve(o.tasks);
-  // cudaKernelNodeParams::kernelParams is void**.  Keep graph argument
-  // storage non-const even though the value originates in const Options.
-  int n = o.elements;
-  float const* src = input;
-  float* dst = ping;
+  cudaGraph_t graph{}; CUDA_CHECK(cudaGraphCreate(&graph, 0));
+  std::vector<cudaGraphNode_t> nodes; nodes.reserve(o.tasks);
+  int n = o.elements; float const* src = input; float* dst = ping;
   for (int stage = 0; stage < o.tasks; ++stage) {
     void* args[] = {&src, &dst, &n, &stage};
-    cudaKernelNodeParams params{};
-    params.func = reinterpret_cast<void*>(task_kernel);
-    params.gridDim = dim3((o.elements + o.block - 1) / o.block);
-    params.blockDim = dim3(o.block);
-    params.kernelParams = args;
+    cudaKernelNodeParams p{};
+    p.func = reinterpret_cast<void*>(task_kernel);
+    p.gridDim = dim3((o.elements + o.block - 1) / o.block); p.blockDim = dim3(o.block); p.kernelParams = args;
     cudaGraphNode_t node{};
-    CUDA_CHECK(cudaGraphAddKernelNode(&node, graph,
-        nodes.empty() ? nullptr : &nodes.back(), nodes.empty() ? 0 : 1, &params));
-    nodes.push_back(node);
-    src = dst;
-    dst = (dst == ping) ? pong : ping;
+    CUDA_CHECK(cudaGraphAddKernelNode(&node, graph, nodes.empty() ? nullptr : &nodes.back(), nodes.empty() ? 0 : 1, &p));
+    nodes.push_back(node); src = dst; dst = (dst == ping) ? pong : ping;
   }
-  cudaGraphExec_t executable{};
-  CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-  CUDA_CHECK(cudaGraphDestroy(graph));
-  return executable;
+  cudaGraphExec_t exec{}; CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0)); CUDA_CHECK(cudaGraphDestroy(graph)); return exec;
 }
 
-template <typename F>
-std::vector<float> benchmark(F&& fn, int warmup, int repeats) {
-  for (int i = 0; i < warmup; ++i) fn();
+template <typename F> std::vector<float> benchmark(F&& f, int warmup, int repeats) {
+  for (int i = 0; i < warmup; ++i) f();
   CUDA_CHECK(cudaDeviceSynchronize());
-  cudaEvent_t start{}, stop{};
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-  std::vector<float> samples;
-  samples.reserve(repeats);
+  cudaEvent_t start{}, stop{}; CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
+  std::vector<float> samples; samples.reserve(repeats);
   for (int i = 0; i < repeats; ++i) {
-    CUDA_CHECK(cudaEventRecord(start));
-    fn();
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float milliseconds = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-    samples.push_back(milliseconds * 1000.0f);
+    CUDA_CHECK(cudaEventRecord(start)); f(); CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
+    float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop)); samples.push_back(ms * 1000.0f);
   }
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  return samples;
+  CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop)); return samples;
 }
 
-float percentile(std::vector<float> values, float p) {
-  std::sort(values.begin(), values.end());
-  size_t const index = static_cast<size_t>(std::ceil(p * values.size())) - 1;
-  return values[std::min(index, values.size() - 1)];
-}
-
-void report(char const* name, std::vector<float> const& samples) {
-  float sum = 0.0f;
-  for (float x : samples) sum += x;
-  std::printf("%-18s p50=%8.2f us  p90=%8.2f us  mean=%8.2f us\n", name,
-              percentile(samples, 0.50f), percentile(samples, 0.90f),
-              sum / samples.size());
-}
-
-float max_abs_difference(float const* a, float const* b, int n) {
-  float maximum = 0.0f;
-  for (int i = 0; i < n; ++i) maximum = std::max(maximum, std::abs(a[i] - b[i]));
-  return maximum;
-}
+float percentile(std::vector<float> x, float p) { std::sort(x.begin(), x.end()); return x[std::min(static_cast<size_t>(std::ceil(p * x.size())) - 1, x.size() - 1)]; }
+void report(char const* name, std::vector<float> const& x) { float sum = 0; for (float v : x) sum += v; std::printf("%-18s p50=%8.2f us  p90=%8.2f us  mean=%8.2f us\n", name, percentile(x, .5f), percentile(x, .9f), sum / x.size()); }
+float max_abs_difference(float const* a, float const* b, int n) { float m = 0; for (int i = 0; i < n; ++i) m = std::max(m, std::abs(a[i] - b[i])); return m; }
 
 int main(int argc, char** argv) {
   try {
-    Options const o = parse_options(argc, argv);
-    cudaDeviceProp prop{};
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    if (o.elements > 1 << 20)
-      throw std::runtime_error("MPK-v0 uses one CTA; keep --elements <= 1048576");
-    std::printf("device=%s sm_%d%d, elements=%d tasks=%d block=%d\n", prop.name,
-                prop.major, prop.minor, o.elements, o.tasks, o.block);
-
-    std::vector<float> host_input(o.elements);
-    for (int i = 0; i < o.elements; ++i) host_input[i] = 0.001f * (i % 113 - 56);
-    float *input{}, *baseline_ping{}, *baseline_pong{}, *graph_ping{}, *graph_pong{}, *mpk_ping{}, *mpk_pong{};
-    size_t const bytes = sizeof(float) * o.elements;
-    CUDA_CHECK(cudaMalloc(&input, bytes)); CUDA_CHECK(cudaMalloc(&baseline_ping, bytes)); CUDA_CHECK(cudaMalloc(&baseline_pong, bytes));
-    CUDA_CHECK(cudaMalloc(&graph_ping, bytes)); CUDA_CHECK(cudaMalloc(&graph_pong, bytes));
-    CUDA_CHECK(cudaMalloc(&mpk_ping, bytes)); CUDA_CHECK(cudaMalloc(&mpk_pong, bytes));
-    CUDA_CHECK(cudaMemcpy(input, host_input.data(), bytes, cudaMemcpyHostToDevice));
-
-    cudaGraphExec_t graph = build_graph(input, graph_ping, graph_pong, o);
-    auto baseline = [&] { run_baseline(input, baseline_ping, baseline_pong, o); };
+    Options const o = parse_options(argc, argv); cudaDeviceProp prop{}; CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    int const tiles = (o.elements + o.block - 1) / o.block;
+    int const workers = o.workers == 0 ? std::min(tiles, prop.multiProcessorCount) : o.workers;
+    if (workers <= 0 || workers > prop.multiProcessorCount) throw std::runtime_error("--workers must be in [1, SM count]");
+    std::printf("device=%s sm_%d%d, elements=%d tasks=%d block=%d tiles=%d workers=%d\n", prop.name, prop.major, prop.minor, o.elements, o.tasks, o.block, tiles, workers);
+    std::vector<float> host_input(o.elements); for (int i = 0; i < o.elements; ++i) host_input[i] = .001f * (i % 113 - 56);
+    float *input{}, *bp{}, *bq{}, *gp{}, *gq{}, *mp{}, *mq{}; PersistentState* state{}; size_t const bytes = sizeof(float) * o.elements;
+    CUDA_CHECK(cudaMalloc(&input, bytes)); CUDA_CHECK(cudaMalloc(&bp, bytes)); CUDA_CHECK(cudaMalloc(&bq, bytes)); CUDA_CHECK(cudaMalloc(&gp, bytes)); CUDA_CHECK(cudaMalloc(&gq, bytes)); CUDA_CHECK(cudaMalloc(&mp, bytes)); CUDA_CHECK(cudaMalloc(&mq, bytes)); CUDA_CHECK(cudaMalloc(&state, sizeof(PersistentState)));
+    CUDA_CHECK(cudaMemset(state, 0, sizeof(PersistentState))); CUDA_CHECK(cudaMemcpy(input, host_input.data(), bytes, cudaMemcpyHostToDevice));
+    cudaGraphExec_t graph = build_graph(input, gp, gq, o);
+    auto baseline = [&] { run_baseline(input, bp, bq, o); };
     auto graph_launch = [&] { CUDA_CHECK(cudaGraphLaunch(graph, 0)); };
-    auto mpk = [&] { mpk_persistent_kernel<<<1, o.block>>>(input, mpk_ping, mpk_pong, o.elements, o.tasks); CUDA_CHECK(cudaGetLastError()); };
-
+    int epoch = 0;
+    auto mpk = [&] { mpk_persistent_kernel<<<workers, o.block>>>(input, mp, mq, o.elements, o.tasks, tiles, state, ++epoch); CUDA_CHECK(cudaGetLastError()); };
     baseline(); graph_launch(); mpk(); CUDA_CHECK(cudaDeviceSynchronize());
-    float const* baseline_output = (o.tasks % 2) ? baseline_ping : baseline_pong;
-    float const* graph_output = (o.tasks % 2) ? graph_ping : graph_pong;
-    float const* mpk_output = (o.tasks % 2) ? mpk_ping : mpk_pong;
-    std::vector<float> baseline_host(o.elements), graph_host(o.elements), mpk_host(o.elements);
-    CUDA_CHECK(cudaMemcpy(baseline_host.data(), baseline_output, bytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(graph_host.data(), graph_output, bytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(mpk_host.data(), mpk_output, bytes, cudaMemcpyDeviceToHost));
-    float const graph_error = max_abs_difference(baseline_host.data(), graph_host.data(), o.elements);
-    float const mpk_error = max_abs_difference(baseline_host.data(), mpk_host.data(), o.elements);
-    std::printf("correctness: graph max_abs=%g, mpk max_abs=%g\n", graph_error, mpk_error);
-    if (graph_error != 0.0f || mpk_error != 0.0f) throw std::runtime_error("backend outputs differ");
-
-    auto const baseline_samples = benchmark(baseline, o.warmup, o.repeats);
-    auto const graph_samples = benchmark(graph_launch, o.warmup, o.repeats);
-    auto const mpk_samples = benchmark(mpk, o.warmup, o.repeats);
-    report("baseline <<<>>>", baseline_samples);
-    report("cudaGraphLaunch", graph_samples);
-    report("mpk persistent", mpk_samples);
-    std::printf("Note: MPK-v0 is a static single-CTA chain, not a general task scheduler.\n");
-    CUDA_CHECK(cudaGraphExecDestroy(graph));
-    CUDA_CHECK(cudaFree(input)); CUDA_CHECK(cudaFree(baseline_ping)); CUDA_CHECK(cudaFree(baseline_pong));
-    CUDA_CHECK(cudaFree(graph_ping)); CUDA_CHECK(cudaFree(graph_pong)); CUDA_CHECK(cudaFree(mpk_ping)); CUDA_CHECK(cudaFree(mpk_pong));
-  } catch (std::exception const& e) {
-    std::fprintf(stderr, "ERROR: %s\n", e.what());
-    return 1;
-  }
+    float const* bo = (o.tasks & 1) ? bp : bq; float const* go = (o.tasks & 1) ? gp : gq; float const* mo = (o.tasks & 1) ? mp : mq;
+    std::vector<float> bh(o.elements), gh(o.elements), mh(o.elements); CUDA_CHECK(cudaMemcpy(bh.data(), bo, bytes, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(gh.data(), go, bytes, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(mh.data(), mo, bytes, cudaMemcpyDeviceToHost));
+    float const ge = max_abs_difference(bh.data(), gh.data(), o.elements), me = max_abs_difference(bh.data(), mh.data(), o.elements); std::printf("correctness: graph max_abs=%g, mpk max_abs=%g\n", ge, me); if (ge != 0 || me != 0) throw std::runtime_error("backend outputs differ");
+    report("baseline <<<>>>", benchmark(baseline, o.warmup, o.repeats)); report("cudaGraphLaunch", benchmark(graph_launch, o.warmup, o.repeats)); report("mpk persistent", benchmark(mpk, o.warmup, o.repeats));
+    std::printf("Note: MPK-v1 is a minimal multi-CTA tile scheduler, not Mirage's full runtime.\n");
+    CUDA_CHECK(cudaGraphExecDestroy(graph)); CUDA_CHECK(cudaFree(input)); CUDA_CHECK(cudaFree(bp)); CUDA_CHECK(cudaFree(bq)); CUDA_CHECK(cudaFree(gp)); CUDA_CHECK(cudaFree(gq)); CUDA_CHECK(cudaFree(mp)); CUDA_CHECK(cudaFree(mq)); CUDA_CHECK(cudaFree(state));
+  } catch (std::exception const& e) { std::fprintf(stderr, "ERROR: %s\n", e.what()); return 1; }
 }
