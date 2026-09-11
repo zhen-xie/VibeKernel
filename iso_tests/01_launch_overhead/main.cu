@@ -100,10 +100,13 @@ cudaGraphExec_t build_graph(float const* input, float* ping, float* pong, Option
   CUDA_CHECK(cudaGraphCreate(&graph, 0));
   std::vector<cudaGraphNode_t> nodes;
   nodes.reserve(o.tasks);
+  // cudaKernelNodeParams::kernelParams is void**.  Keep graph argument
+  // storage non-const even though the value originates in const Options.
+  int n = o.elements;
   float const* src = input;
   float* dst = ping;
   for (int stage = 0; stage < o.tasks; ++stage) {
-    void* args[] = {&src, &dst, &o.elements, &stage};
+    void* args[] = {&src, &dst, &n, &stage};
     cudaKernelNodeParams params{};
     params.func = reinterpret_cast<void*>(task_kernel);
     params.gridDim = dim3((o.elements + o.block - 1) / o.block);
