@@ -29,8 +29,12 @@ struct QueueState { int next_task; };
 __global__ void mpk_independent_kernel(float const* input, float* output,
                                        int elements_per_task, int task_count,
                                        QueueState* queue) {
+  __shared__ int task_id;
   while (true) {
-    int const task_id = atomicAdd(&queue->next_task, 1);
+    // A worker is a CTA, not an individual CUDA thread.  Claim exactly one
+    // logical task for the whole CTA, then let its threads cooperate on it.
+    if (threadIdx.x == 0) task_id = atomicAdd(&queue->next_task, 1);
+    __syncthreads();
     if (task_id >= task_count) return;
     float* task_output = output + static_cast<size_t>(task_id) * elements_per_task;
     for (int i = threadIdx.x; i < elements_per_task; i += blockDim.x)
