@@ -19,7 +19,9 @@ __global__ void task_kernel(float const* input, float* output, int n, int stage)
   if (i < n) output[i] = task_op(input[i], stage);
 }
 
-struct PersistentState { int next_tile, completed_tiles, stage, epoch; };
+// ticket = (stage << 32) | next_tile.  Keeping these two values in one atomic
+// word prevents a worker from claiming a tile for a stage that just ended.
+struct PersistentState { unsigned long long ticket; int completed_tiles, epoch; };
 
 // Minimal multi-CTA device scheduler. Workers claim tiles of the current
 // logical task; its last tile opens the next dependent task.
@@ -28,7 +30,7 @@ __global__ void mpk_persistent_kernel(float const* input, float* ping, float* po
                                       PersistentState* state, int launch_epoch) {
   __shared__ int local_stage, local_tile;
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    state->next_tile = 0; state->completed_tiles = 0; state->stage = 0;
+    state->ticket = 0; state->completed_tiles = 0;
     __threadfence();
     atomicExch(&state->epoch, launch_epoch);
   }
@@ -36,15 +38,27 @@ __global__ void mpk_persistent_kernel(float const* input, float* ping, float* po
 
   while (true) {
     if (threadIdx.x == 0) {
-      local_stage = atomicAdd(&state->stage, 0);
-      local_tile = local_stage < tasks ? atomicAdd(&state->next_tile, 1) : -1;
+      // Atomically claim (stage, tile) with a CAS.  A separate stage load and
+      // next_tile increment would permit a stale worker to corrupt a later
+      // stage after its predecessor completed.
+      while (true) {
+        unsigned long long const old = atomicCAS(&state->ticket, 0ULL, 0ULL);
+        int const stage = static_cast<int>(old >> 32);
+        int const tile = static_cast<int>(old & 0xffffffffULL);
+        if (stage >= tasks) { local_stage = stage; local_tile = -1; break; }
+        if (tile >= tiles) {
+          while (static_cast<int>(atomicCAS(&state->ticket, 0ULL, 0ULL) >> 32) == stage) {}
+          continue;
+        }
+        unsigned long long const desired =
+            (static_cast<unsigned long long>(stage) << 32) | static_cast<unsigned int>(tile + 1);
+        if (atomicCAS(&state->ticket, old, desired) == old) {
+          local_stage = stage; local_tile = tile; break;
+        }
+      }
     }
     __syncthreads();
     if (local_stage >= tasks) return;
-    if (local_tile >= tiles) {
-      while (atomicAdd(&state->stage, 0) == local_stage) {}
-      continue;
-    }
     // This data crosses CTA boundaries at every stage.  Volatile prevents a
     // worker from reusing a stale L1 value after the device-side stage barrier;
     // __threadfence below publishes the producer CTA's writes first.
@@ -56,9 +70,10 @@ __global__ void mpk_persistent_kernel(float const* input, float* ping, float* po
     if (threadIdx.x == 0) {
       __threadfence();
       if (atomicAdd(&state->completed_tiles, 1) == tiles - 1) {
-        state->next_tile = 0; state->completed_tiles = 0;
+        state->completed_tiles = 0;
         __threadfence();
-        atomicAdd(&state->stage, 1);
+        atomicExch(&state->ticket,
+                   static_cast<unsigned long long>(local_stage + 1) << 32);
       }
     }
     __syncthreads();
