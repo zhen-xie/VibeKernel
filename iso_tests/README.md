@@ -30,3 +30,15 @@ Use small per-task work (for example, 256--16384 elements) and progressively
 increase `--tasks` to expose dispatch overhead.  The next experiment should
 replace this elementwise chain with a transformer-block DAG while retaining
 the same three runners.
+
+## 02: independent task queue
+
+`02_independent_tasks` removes all data dependencies.  Each logical task is a
+single CTA that reads the same input and writes a disjoint output slice.  The
+persistent implementation therefore performs only `atomicAdd(next_task)` task
+claims—no stage barrier, dependency counter, or worker spin wait.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/iso_tests/02_independent_tasks/independent_tasks \
+  --elements 4096 --tasks 64 --warmup 100 --repeats 1000
+```
