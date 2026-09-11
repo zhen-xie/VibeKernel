@@ -62,7 +62,8 @@ __global__ void mpk_persistent_kernel(float const* input, float* ping, float* po
     // This data crosses CTA boundaries at every stage.  Volatile prevents a
     // worker from reusing a stale L1 value after the device-side stage barrier;
     // __threadfence below publishes the producer CTA's writes first.
-    float const volatile* src = (local_stage & 1) ? ping : input;
+    float const volatile* src = local_stage == 0 ? input
+        : ((local_stage & 1) ? ping : pong);
     float volatile* dst = (local_stage & 1) ? pong : ping;
     int const i = local_tile * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = task_op(src[i], local_stage);
