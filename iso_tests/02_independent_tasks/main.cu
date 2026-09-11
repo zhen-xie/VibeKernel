@@ -23,19 +23,12 @@ __global__ void independent_task_kernel(float const* input, float* output,
     task_output[i] = task_op(input[i], task_id);
 }
 
-struct QueueState { int next_task, epoch; };
+struct QueueState { int next_task; };
 
 // No dependency tracking: workers simply claim independent logical tasks.
 __global__ void mpk_independent_kernel(float const* input, float* output,
                                        int elements_per_task, int task_count,
-                                       QueueState* queue, int launch_epoch) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    queue->next_task = 0;
-    __threadfence();
-    atomicExch(&queue->epoch, launch_epoch);
-  }
-  while (atomicAdd(&queue->epoch, 0) != launch_epoch) {}
-
+                                       QueueState* queue) {
   while (true) {
     int const task_id = atomicAdd(&queue->next_task, 1);
     if (task_id >= task_count) return;
@@ -99,6 +92,27 @@ template <typename F> std::vector<float> benchmark(F&& f, int warmup, int repeat
   CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop)); return samples;
 }
 
+// Reset the device queue before the start event. The reset is necessary setup
+// for each launch but is deliberately excluded from the measured kernel time.
+template <typename F> std::vector<float> benchmark_mpk(F&& f, QueueState* queue,
+                                                       int warmup, int repeats) {
+  for (int i = 0; i < warmup; ++i) {
+    CUDA_CHECK(cudaMemsetAsync(queue, 0, sizeof(QueueState), 0));
+    f();
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  cudaEvent_t start{}, stop{}; CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
+  std::vector<float> samples; samples.reserve(repeats);
+  for (int i = 0; i < repeats; ++i) {
+    CUDA_CHECK(cudaMemsetAsync(queue, 0, sizeof(QueueState), 0));
+    CUDA_CHECK(cudaEventRecord(start));
+    f();
+    CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
+    float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop)); samples.push_back(ms * 1000.0f);
+  }
+  CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(stop)); return samples;
+}
+
 float p50(std::vector<float> x) { std::sort(x.begin(), x.end()); return x[(x.size() - 1) / 2]; }
 void report(char const* name, std::vector<float> const& x) { float sum = 0; for (float v : x) sum += v; std::printf("%-18s p50=%8.2f us  mean=%8.2f us\n", name, p50(x), sum / x.size()); }
 float max_abs(float const* a, float const* b, size_t n) { float m = 0; for (size_t i = 0; i < n; ++i) m = std::max(m, std::abs(a[i] - b[i])); return m; }
@@ -117,13 +131,13 @@ int main(int argc, char** argv) {
     cudaGraphExec_t graph = build_graph(input, graph_out, o);
     auto baseline = [&] { run_baseline(input, baseline_out, o); };
     auto graph_launch = [&] { CUDA_CHECK(cudaGraphLaunch(graph, 0)); };
-    int epoch = 0; auto mpk = [&] { mpk_independent_kernel<<<workers, o.block>>>(input, mpk_out, o.elements, o.tasks, queue, ++epoch); CUDA_CHECK(cudaGetLastError()); };
+    auto mpk = [&] { mpk_independent_kernel<<<workers, o.block>>>(input, mpk_out, o.elements, o.tasks, queue); CUDA_CHECK(cudaGetLastError()); };
     baseline(); graph_launch(); mpk(); CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<float> baseline_host(output_count), graph_host(output_count), mpk_host(output_count);
     CUDA_CHECK(cudaMemcpy(baseline_host.data(), baseline_out, output_bytes, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(graph_host.data(), graph_out, output_bytes, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(mpk_host.data(), mpk_out, output_bytes, cudaMemcpyDeviceToHost));
     float const graph_error = max_abs(baseline_host.data(), graph_host.data(), output_count), mpk_error = max_abs(baseline_host.data(), mpk_host.data(), output_count);
     std::printf("correctness: graph max_abs=%g, mpk max_abs=%g\n", graph_error, mpk_error); if (graph_error != 0 || mpk_error != 0) throw std::runtime_error("backend outputs differ");
-    report("baseline <<<>>>", benchmark(baseline, o.warmup, o.repeats)); report("cudaGraphLaunch", benchmark(graph_launch, o.warmup, o.repeats)); report("mpk persistent", benchmark(mpk, o.warmup, o.repeats));
+    report("baseline <<<>>>", benchmark(baseline, o.warmup, o.repeats)); report("cudaGraphLaunch", benchmark(graph_launch, o.warmup, o.repeats)); report("mpk persistent", benchmark_mpk(mpk, queue, o.warmup, o.repeats));
     std::printf("Note: MPK uses only an independent-task atomic queue; no dependency counters or stage barriers.\n");
     CUDA_CHECK(cudaGraphExecDestroy(graph)); CUDA_CHECK(cudaFree(input)); CUDA_CHECK(cudaFree(baseline_out)); CUDA_CHECK(cudaFree(graph_out)); CUDA_CHECK(cudaFree(mpk_out)); CUDA_CHECK(cudaFree(queue));
   } catch (std::exception const& e) { std::fprintf(stderr, "ERROR: %s\n", e.what()); return 1; }
