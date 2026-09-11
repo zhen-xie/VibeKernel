@@ -7,3 +7,4 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 
 add_subdirectory(01_launch_overhead)
 add_subdirectory(02_independent_tasks)
+add_subdirectory(03_independent_gemm_tasks)

@@ -42,3 +42,13 @@ claims—no stage barrier, dependency counter, or worker spin wait.
 CUDA_VISIBLE_DEVICES=0 ./build/iso_tests/02_independent_tasks/independent_tasks \
   --elements 4096 --tasks 64 --warmup 100 --repeats 1000
 ```
+
+## 03: independent GEMM tasks
+
+Each task is a one-CTA FP32 GEMM, `C_task[M,N] = A_task[M,K] × B[K,N]`. Tasks
+share B but write disjoint C slices, so they have no data dependency.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/iso_tests/03_independent_gemm_tasks/independent_gemm_tasks \
+  --m 16 --n 16 --k 256 --tasks 64 --warmup 100 --repeats 1000
+```
